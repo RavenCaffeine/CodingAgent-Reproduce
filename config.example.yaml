@@ -1,0 +1,57 @@
+# ============================================================================
+# MewCode config / 配置文件 —— copy to config.yaml / 复制为 config.yaml
+#
+# Keep exactly ONE provider block active (uncommented); comment out the rest.
+# 只保留一组 provider 启用（顶格、无 #），其余整段注释掉。
+# Switch provider = uncomment the one you want, comment the others.
+# 切换 provider = 取消想用那组的注释，注释掉其他组。
+#
+# Four core fields / 四个核心字段:
+#   protocol  protocol to use / 走哪家协议   anthropic | openai | deepseek
+#   model     model id / 用哪个模型
+#   base_url  endpoint (optional) / 请求地址（可选）
+#   api_key   auth / 认证                    see "API key" note below / 见下方说明
+# Optional / 可选:
+#   thinking  extended thinking / 扩展思考    Anthropic & DeepSeek; OpenAI ignores
+#   name      display label / 显示名
+#
+# ── API key: 3 ways / 三种写法 (pick one / 任选其一) ─────────────────────────
+#   1) manual literal / 手动填入:  api_key: sk-xxxxx
+#   2) env import / 环境导入:      api_key: ${ANTHROPIC_API_KEY}
+#   3) explicit env / 显式声明:    api_key_env: ANTHROPIC_API_KEY
+#   If omitted / 都不写: falls back to the provider's default env var
+#     (ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY).
+#   Priority / 优先级: manual literal > env var / 手动填入 > 环境变量
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Option A / 方案 A: Anthropic Claude  (active / 当前启用)
+# ---------------------------------------------------------------------------
+protocol: anthropic
+model: claude-sonnet-4-6              # e.g. claude-opus-4-6 / claude-sonnet-4-6
+base_url: https://api.anthropic.com  # optional / 可选
+api_key: ${ANTHROPIC_API_KEY}        # or literal / 或明文: sk-ant-xxxxx
+thinking: true                       # adaptive on opus/sonnet-4-6+ / 否则固定 budget
+
+
+# ---------------------------------------------------------------------------
+# Option B / 方案 B: OpenAI (Responses API)
+#   uncomment this block & comment out the others / 取消注释并注释掉其他组
+# ---------------------------------------------------------------------------
+# protocol: openai
+# model: gpt-4.1                      # e.g. gpt-4.1 / gpt-4o / o4-mini
+# base_url: https://api.openai.com/v1 # optional / 可选
+# api_key: ${OPENAI_API_KEY}          # or literal / 或明文: sk-xxxxx
+# thinking: false                     # OpenAI ignores / OpenAI 忽略此项
+
+
+# ---------------------------------------------------------------------------
+# Option C / 方案 C: DeepSeek V4 (Chat Completions API)
+#   uncomment this block & comment out the others / 取消注释并注释掉其他组
+# ---------------------------------------------------------------------------
+# protocol: deepseek
+# model: deepseek-v4-pro              # deepseek-v4-pro / deepseek-v4-flash
+# base_url: https://api.deepseek.com  # optional, this is the default / 可选，默认值
+# api_key: ${DEEPSEEK_API_KEY}        # or literal / 或明文: sk-xxxxx
+# thinking: false                     # reasoning streams auto / reasoning 自动流式
