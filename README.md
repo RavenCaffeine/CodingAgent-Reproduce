@@ -2,10 +2,10 @@
 
 **English** | [中文](README.zh-CN.md)
 
-A terminal AI assistant (Coding Agent) in Python, à la Claude Code. This step
-delivers **pure streaming chat**: launch in the terminal, type a question, and
-the model's reply prints token by token. Multi-turn — it remembers the
-conversation.
+A terminal AI assistant (Coding Agent) in Python, à la Claude Code. Launch in
+the terminal, type a question, and the model's reply streams token by token.
+Multi-turn (it remembers the conversation) and **tool-using**: it can read,
+write, and edit files, run shell commands, and search the codebase.
 
 ## Features
 
@@ -19,15 +19,24 @@ conversation.
 - Claude **extended thinking** (adaptive on opus/sonnet-4-6+, fixed-budget
   fallback otherwise); DeepSeek **reasoning** is streamed too. Both rendered
   dimmed.
-- No tool use / file editing yet — chat only.
+- **Tool system**: six core tools (`ReadFile` / `WriteFile` / `EditFile` /
+  `Bash` / `Glob` / `Grep`) plus `ToolSearch` and `AskUserQuestion`. Single
+  round per turn — the model calls tools once, gets results, then answers (the
+  automatic multi-step loop comes next chapter).
 
 ## Setup (uv)
 
 Uses [uv](https://docs.astral.sh/uv/) for the environment. Dependencies live in
-`requirements.txt` so new ones are easy to add.
+`requirements.txt` (`anthropic`, `openai`, `pyyaml`, `pydantic` + dev tools) so
+new ones are easy to add. No system dependencies — Glob/Grep are pure Python.
 
 ```bash
 uv venv                              # create .venv
+
+# activate it:
+.venv\Scripts\activate              # Windows (PowerShell / cmd)
+source .venv/bin/activate            # Linux / macOS
+
 uv pip install -r requirements.txt   # install deps
 cp config.example.yaml config.yaml   # then edit it
 ```
@@ -88,6 +97,29 @@ over an environment variable.
 Set an env var before running:
 `export ANTHROPIC_API_KEY=sk-ant-...` (PowerShell:
 `$env:ANTHROPIC_API_KEY="sk-ant-..."`).
+
+## Tools
+
+The model can call tools to act on your project: they execute, results are fed
+back, and the model answers based on them. **Single round per turn** — it calls
+tools once, then responds (the automatic multi-step loop comes next chapter).
+
+| Tool | What it does |
+|------|--------------|
+| `ReadFile` | Read a text file with 1-based line numbers (`offset` / `limit`). |
+| `WriteFile` | Write a file, creating parent directories. |
+| `EditFile` | Replace a **unique** occurrence of a string (errors if missing or ambiguous). |
+| `Bash` | Run a shell command with a timeout; captures stdout/stderr/exit code. |
+| `Glob` | List files matching a glob (skips `.git`, `node_modules`, …). |
+| `Grep` | Search file contents by regex; returns `file:line:text`. |
+
+Two extras: **`ToolSearch`** does progressive disclosure of *deferred* tools
+(`select:Name1,Name2` or keywords), and **`AskUserQuestion`** lets the model ask
+structured questions. Tool schemas are generated from Pydantic models and
+exported in the shape each provider expects (Anthropic `input_schema`, OpenAI
+Responses flat function, DeepSeek Chat-Completions nested `function`). Tool
+failures come back as structured errors so the model can retry instead of
+crashing.
 
 ## Run
 
