@@ -253,14 +253,5 @@ async def test_cancel_propagates(tmp_path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     # history stays consistent: the user message is still there
-    assert conv.get_messages()[0].content == "hang"
-
-
-# --- system prompt --------------------------------------------------------- #
-
-
-def test_system_prompt_plan_vs_normal() -> None:
-    from mewcode.prompts import build_system_prompt
-
-    assert "PLAN MODE" not in build_system_prompt()
-    assert "PLAN MODE" in build_system_prompt(plan_mode=True)
+    contents = [m.content for m in conv.get_messages()]
+    assert "hang" in contents

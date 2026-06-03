@@ -146,7 +146,12 @@ async def test_repl_streams_and_remembers(monkeypatch, capsys):
     assert "Hello Rick!" in out
     assert "You said hi." in out
 
-    msgs = app.conversation.get_messages()
+    # ch05 injects an environment <system-reminder> as the first user message;
+    # drop it to inspect the real conversational turns.
+    msgs = [
+        m for m in app.conversation.get_messages()
+        if not m.content.startswith("<system-reminder>")
+    ]
     roles = [m.role for m in msgs]
     assert roles == ["user", "assistant", "user", "assistant"]
     assert msgs[0].content == "hi"

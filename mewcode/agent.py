@@ -33,7 +33,11 @@ from mewcode.conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from mewcode.prompts import build_plan_mode_reminder, build_system_prompt
+from mewcode.prompts import (
+    build_environment_context,
+    build_plan_mode_reminder,
+    build_system_prompt,
+)
 from mewcode.tools.base import (
     MAX_OUTPUT_CHARS,
     StreamEnd,
@@ -308,6 +312,10 @@ class Agent:
         consecutive_unknown = 0
         recoveries = 0
 
+        # Inject environment context once, on the user channel (ch05). Stays
+        # out of the cacheable system prompt; idempotent via env_injected.
+        conversation.inject_environment(build_environment_context(self.work_dir))
+
         while True:
             iteration += 1
             if iteration > self.max_iterations:
@@ -319,11 +327,12 @@ class Agent:
                 reminder = build_plan_mode_reminder(
                     plan_path, Path(plan_path).exists(), iteration
                 )
-                # reminder text already carries <system-reminder> tags
-                conversation.add_user_message(reminder)
+                # plan reminder goes through the user channel as a
+                # <system-reminder>, not into the system prompt
+                conversation.add_system_reminder(reminder)
 
             system = build_system_prompt(
-                plan_mode=self.plan_mode, coordinator_mode=self.coordinator_mode
+                coordinator_mode=self.coordinator_mode, work_dir=self.work_dir
             )
             tools = self.registry.get_all_schemas(self.protocol)
 

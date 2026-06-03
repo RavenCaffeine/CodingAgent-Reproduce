@@ -20,6 +20,7 @@ class EditFile(Tool):
     name = "EditFile"
     description = (
         "Replace a unique occurrence of old_string with new_string in a file. "
+        "Read the file first so old_string matches exactly. "
         "Fails if old_string is missing or appears more than once."
     )
     params_model = Params
