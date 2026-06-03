@@ -16,23 +16,20 @@ import sys
 from mewcode.client import LLMClient, LLMError, create_client
 from mewcode.config import ProviderConfig, load_config
 from mewcode.cache import FileCache
-from mewcode.conversation import (
-    ConversationManager,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
+from mewcode.conversation import ConversationManager
+from mewcode.agent import (
+    Agent,
+    ErrorEvent,
+    LoopComplete,
+    RetryEvent,
+    StreamText,
+    ThinkingText,
+    ToolResultEvent,
+    ToolUseEvent,
+    UsageEvent,
 )
 from mewcode.tools import create_default_registry
 from mewcode.tools.ask_user import AskUserTool
-from mewcode.tools.base import (
-    MAX_OUTPUT_CHARS,
-    StreamEnd,
-    TextDelta,
-    ThinkingComplete,
-    ThinkingDelta,
-    ToolCallComplete,
-    ToolCallStart,
-)
 from mewcode.tools.impl.tool_search import ToolSearchTool
 
 # ANSI styling (kept tiny; degrades to plain text in dumb terminals).
@@ -69,103 +66,64 @@ class MewCodeApp:
             ToolSearchTool(self.registry, protocol=config.protocol)
         )
         self.registry.register(AskUserTool())
+        # ch04: the ReAct Agent Loop drives multi-round tool use.
+        self.agent = Agent(self.client, self.registry, config.protocol)
 
     async def _read_line(self, prompt: str) -> str:
         """Read a line without blocking the event loop."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, input, prompt)
 
-    async def _consume(self, tools: list) -> tuple[str, list[ThinkingBlock], list[ToolUseBlock]]:
-        """Stream one assistant turn, render it, and write it to history.
-
-        Returns the text, thinking blocks, and any tool calls the model made.
-        """
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        thinking_blocks: list[ThinkingBlock] = []
-        tool_uses: list[ToolUseBlock] = []
-        in_thinking = False
-
-        sys.stdout.write(f"{_GREEN}MewCode:{_RESET} ")
-        sys.stdout.flush()
-
-        async for event in self.client.stream(
-            self.conversation, system=self.system, tools=tools
-        ):
-            if isinstance(event, ThinkingDelta):
-                if not in_thinking:
-                    sys.stdout.write(f"\n{_DIM}[thinking] ")
-                    in_thinking = True
-                sys.stdout.write(event.text)
-                sys.stdout.flush()
-                thinking_parts.append(event.text)
-            elif isinstance(event, ThinkingComplete):
-                if in_thinking:
-                    sys.stdout.write(f"{_RESET}\n{_GREEN}MewCode:{_RESET} ")
-                    in_thinking = False
-                thinking_blocks.append(
-                    ThinkingBlock(event.thinking, event.signature)
-                )
-            elif isinstance(event, TextDelta):
-                sys.stdout.write(event.text)
-                sys.stdout.flush()
-                text_parts.append(event.text)
-            elif isinstance(event, ToolCallStart):
-                sys.stdout.write(f"\n{_DIM}[tool] {event.tool_name}...{_RESET}\n")
-                sys.stdout.flush()
-            elif isinstance(event, ToolCallComplete):
-                tool_uses.append(
-                    ToolUseBlock(event.tool_id, event.tool_name, event.arguments)
-                )
-            elif isinstance(event, StreamEnd):
-                self.total_input_tokens += event.input_tokens
-                self.total_output_tokens += event.output_tokens
-
-        sys.stdout.write("\n")
-        if thinking_parts and not thinking_blocks:
-            thinking_blocks.append(ThinkingBlock("".join(thinking_parts)))
-
-        self.conversation.add_assistant_message(
-            "".join(text_parts), tool_uses=tool_uses, thinking_blocks=thinking_blocks
-        )
-        return "".join(text_parts), thinking_blocks, tool_uses
-
-    async def _execute_tools(self, tool_uses: list[ToolUseBlock]) -> None:
-        """Run each tool call, render it, and feed results back into history."""
-        results: list[ToolResultBlock] = []
-        for tu in tool_uses:
-            try:
-                tool = self.registry.get(tu.name)
-                params = tool.params_model.model_validate(tu.input)
-                result = await tool.execute(params)
-                output = result.output
-                is_error = result.is_error
-            except KeyError:
-                output, is_error = f"Unknown tool: {tu.name}", True
-            except Exception as e:  # noqa: BLE001 — never crash the loop
-                output, is_error = f"Tool error: {e}", True
-
-            if len(output) > MAX_OUTPUT_CHARS:
-                output = output[:MAX_OUTPUT_CHARS] + "\n... (truncated)"
-            tag = f"{_YELLOW}error{_RESET}" if is_error else f"{_GREEN}ok{_RESET}"
-            sys.stdout.write(f"{_DIM}  └ {tu.name} [{tag}{_DIM}]{_RESET}\n")
-            results.append(ToolResultBlock(tu.id, output, is_error=is_error))
-
-        self.conversation.add_tool_results_message(results)
-
     async def _stream_reply(self) -> None:
-        """Handle one user turn: stream, run tools once, stream the answer.
-
-        Single round (ch03): the model may call tools once; we execute them,
-        feed results back, and stream the final answer. The auto Agent Loop is
-        ch04, so we do not iterate further even if more tools are requested.
-        """
-        tools = self.registry.get_all_schemas(self.config.protocol)
+        """Drive the Agent Loop for one user turn and render its events."""
+        printed_prefix = False
+        in_thinking = False
         try:
-            _, _, tool_uses = await self._consume(tools)
-            if tool_uses:
-                await self._execute_tools(tool_uses)
-                await self._consume(tools)
+            async for event in self.agent.run(self.conversation):
+                if isinstance(event, ThinkingText):
+                    if not in_thinking:
+                        sys.stdout.write(f"{_GREEN}MewCode:{_RESET} {_DIM}[thinking] ")
+                        in_thinking = True
+                        printed_prefix = True
+                    sys.stdout.write(event.text)
+                    sys.stdout.flush()
+                elif isinstance(event, StreamText):
+                    if in_thinking:
+                        sys.stdout.write(_RESET + "\n")
+                        in_thinking = False
+                        printed_prefix = False
+                    if not printed_prefix:
+                        sys.stdout.write(f"{_GREEN}MewCode:{_RESET} ")
+                        printed_prefix = True
+                    sys.stdout.write(event.text)
+                    sys.stdout.flush()
+                elif isinstance(event, ToolUseEvent):
+                    if in_thinking:
+                        sys.stdout.write(_RESET)
+                        in_thinking = False
+                    sys.stdout.write(f"\n{_DIM}[tool] {event.tool_name}…{_RESET}\n")
+                    sys.stdout.flush()
+                    printed_prefix = False
+                elif isinstance(event, ToolResultEvent):
+                    tag = (
+                        f"{_YELLOW}error{_RESET}" if event.is_error
+                        else f"{_GREEN}ok{_RESET}"
+                    )
+                    sys.stdout.write(f"{_DIM}  └ {event.tool_name} [{tag}{_DIM}]{_RESET}\n")
+                    sys.stdout.flush()
+                elif isinstance(event, RetryEvent):
+                    sys.stdout.write(f"{_DIM}↻ retrying: {event.reason}{_RESET}\n")
+                elif isinstance(event, UsageEvent):
+                    self.total_input_tokens += event.input_tokens
+                    self.total_output_tokens += event.output_tokens
+                elif isinstance(event, LoopComplete):
+                    if printed_prefix or in_thinking:
+                        sys.stdout.write("\n")
+                elif isinstance(event, ErrorEvent):
+                    sys.stdout.write(f"\n{_YELLOW}[error] {event.message}{_RESET}\n")
+        except asyncio.CancelledError:
+            sys.stdout.write(f"\n{_YELLOW}[cancelled]{_RESET}\n")
+            raise
         except LLMError as e:
             sys.stdout.write(f"\n{_YELLOW}[error] {e}{_RESET}\n")
 
@@ -189,8 +147,27 @@ class MewCodeApp:
                     f"out:{self.total_output_tokens}{_RESET}\nbye."
                 )
                 return
+            if user in ("/plan", "/plan on"):
+                self.agent.set_plan_mode(True)
+                print(f"{_DIM}plan mode ON — read-only; /do to execute.{_RESET}\n")
+                continue
+            if user in ("/plan off", "/do"):
+                self.agent.set_plan_mode(False)
+                print(f"{_DIM}plan mode OFF.{_RESET}\n")
+                continue
             self.conversation.add_user_message(user)
-            await self._stream_reply()
+            # Run the turn as a task so ctrl+c cancels the loop cleanly.
+            task = asyncio.ensure_future(self._stream_reply())
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except KeyboardInterrupt:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    pass
             print()
 
 

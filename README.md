@@ -20,9 +20,11 @@ write, and edit files, run shell commands, and search the codebase.
   fallback otherwise); DeepSeek **reasoning** is streamed too. Both rendered
   dimmed.
 - **Tool system**: six core tools (`ReadFile` / `WriteFile` / `EditFile` /
-  `Bash` / `Glob` / `Grep`) plus `ToolSearch` and `AskUserQuestion`. Single
-  round per turn — the model calls tools once, gets results, then answers (the
-  automatic multi-step loop comes next chapter).
+  `Bash` / `Glob` / `Grep`) plus `ToolSearch` and `AskUserQuestion`.
+- **Agent Loop (ReAct)**: a multi-round loop calls the model, runs the tools it
+  asks for, feeds results back, and repeats until it stops asking — with
+  read-concurrent / write-serial batching, a max-iterations cap (50), `/plan`
+  mode (read-only planning), and Ctrl-C cancellation.
 
 ## Setup (uv)
 
@@ -101,8 +103,10 @@ Set an env var before running:
 ## Tools
 
 The model can call tools to act on your project: they execute, results are fed
-back, and the model answers based on them. **Single round per turn** — it calls
-tools once, then responds (the automatic multi-step loop comes next chapter).
+back, and the model answers. The **Agent Loop** repeats this for as many rounds
+as needed (capped at 50), running read-only tools concurrently and write/command
+tools serially. Type `/plan` for read-only planning mode and `/do` to resume
+execution; Ctrl-C cancels the current turn.
 
 | Tool | What it does |
 |------|--------------|
@@ -128,7 +132,15 @@ uv run python -m mewcode            # uses ./config.yaml
 uv run python -m mewcode my.yaml    # or an explicit path
 ```
 
-Type your message; `/exit` quits.
+### In-session commands
+
+| Command | Effect |
+|---------|--------|
+| *(type a message)* | Send it to the agent; it streams the reply and may run tools over multiple rounds. |
+| `/plan` | Enter **plan mode** — read-only. Write/command tools (WriteFile, EditFile, Bash) are blocked; the model investigates and proposes a plan. |
+| `/do` (or `/plan off`) | Leave plan mode and resume normal execution. |
+| `/exit` (or `/quit`, `:q`) | Quit MewCode (prints a token-usage summary). |
+| `Ctrl-C` | Cancel the current turn (mid-stream or mid-tool); the session stays alive. Press it at the prompt to quit. |
 
 ## Tests
 

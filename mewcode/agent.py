@@ -1,0 +1,447 @@
+"""Agent Loop — the ReAct driver (ch04).
+
+One iteration = call LLM -> collect response -> if it asked for tools, execute
+them and feed results back -> next iteration; no tool calls means done. The
+loop is an async generator of `AgentEvent`s so the UI can `async for` over the
+whole process.
+
+ch04 runnable subset: multi-round loop, event stream, tool batching
+(read-concurrent / write+command serial), max-iterations cap, max_tokens
+escalation, Plan Mode interception, and cooperative cancellation. HITL
+permissions, hooks, context compaction, memory, and teams are left as
+extension points for later chapters.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from mewcode.client import LLMClient
+from mewcode.config import MAX_TOKENS_CEILING
+from mewcode.conversation import (
+    ConversationManager,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from mewcode.prompts import build_plan_mode_reminder, build_system_prompt
+from mewcode.tools.base import (
+    MAX_OUTPUT_CHARS,
+    StreamEnd,
+    TextDelta,
+    ThinkingComplete,
+    ThinkingDelta,
+    ToolCallComplete,
+    ToolCallStart,
+)
+from mewcode.tools.registry import ToolRegistry
+
+MAX_OUTPUT_TOKENS_RECOVERIES = 3
+CONSECUTIVE_UNKNOWN_LIMIT = 3
+
+
+# --------------------------------------------------------------------------- #
+# Permission tri-state (extension point for ch06 HITL)
+# --------------------------------------------------------------------------- #
+
+
+class PermissionResponse(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    ALLOW_ALWAYS = "allow_always"
+
+
+# --------------------------------------------------------------------------- #
+# Agent events
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class StreamText:
+    text: str
+
+
+@dataclass
+class ThinkingText:
+    text: str
+
+
+@dataclass
+class RetryEvent:
+    reason: str
+
+
+@dataclass
+class ToolUseEvent:
+    tool_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolResultEvent:
+    tool_id: str
+    tool_name: str
+    output: str
+    is_error: bool = False
+
+
+@dataclass
+class TurnComplete:
+    iteration: int
+
+
+@dataclass
+class LoopComplete:
+    stop_reason: str
+    iterations: int
+
+
+@dataclass
+class UsageEvent:
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
+class ErrorEvent:
+    message: str
+
+
+@dataclass
+class CompactNotification:
+    message: str
+
+
+@dataclass
+class HookEvent:
+    name: str
+    message: str
+
+
+@dataclass
+class PermissionRequest:
+    tool_name: str
+    arguments: dict[str, Any]
+    future: "asyncio.Future[PermissionResponse]"
+
+
+AgentEvent = (
+    StreamText
+    | ThinkingText
+    | RetryEvent
+    | ToolUseEvent
+    | ToolResultEvent
+    | TurnComplete
+    | LoopComplete
+    | UsageEvent
+    | ErrorEvent
+    | CompactNotification
+    | HookEvent
+    | PermissionRequest
+)
+
+
+# --------------------------------------------------------------------------- #
+# Stream collection
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class LLMResponse:
+    """One assistant turn folded out of the raw stream events."""
+
+    text: str = ""
+    thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
+    tool_calls: list[ToolUseBlock] = field(default_factory=list)
+    stop_reason: str = "end_turn"
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class StreamCollector:
+    """Folds a `StreamEvent` stream into an `LLMResponse`, yielding UI events."""
+
+    def __init__(self) -> None:
+        self.response = LLMResponse()
+
+    async def consume(self, stream) -> AsyncIterator[AgentEvent]:
+        cur_thinking = ""
+        async for event in stream:
+            if isinstance(event, TextDelta):
+                self.response.text += event.text
+                yield StreamText(event.text)
+            elif isinstance(event, ThinkingDelta):
+                cur_thinking += event.text
+                yield ThinkingText(event.text)
+            elif isinstance(event, ThinkingComplete):
+                self.response.thinking_blocks.append(
+                    ThinkingBlock(event.thinking or cur_thinking, event.signature)
+                )
+                cur_thinking = ""
+            elif isinstance(event, ToolCallStart):
+                pass  # start is informational; complete carries the args
+            elif isinstance(event, ToolCallComplete):
+                block = ToolUseBlock(event.tool_id, event.tool_name, event.arguments)
+                self.response.tool_calls.append(block)
+                yield ToolUseEvent(event.tool_id, event.tool_name, event.arguments)
+            elif isinstance(event, StreamEnd):
+                self.response.stop_reason = event.stop_reason
+                self.response.input_tokens = event.input_tokens
+                self.response.output_tokens = event.output_tokens
+
+
+# --------------------------------------------------------------------------- #
+# Tool batching
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ToolBatch:
+    concurrent: bool
+    calls: list[ToolUseBlock]
+
+
+def partition_tool_calls(
+    tool_calls: list[ToolUseBlock], registry: ToolRegistry
+) -> list[ToolBatch]:
+    """Group consecutive concurrency-safe calls; others get their own batch.
+
+    Read-only tools (`is_concurrency_safe`) run together; write and command
+    tools each run serially.
+    """
+    batches: list[ToolBatch] = []
+    for tc in tool_calls:
+        safe = False
+        if registry.is_enabled(tc.name):
+            try:
+                safe = registry.get(tc.name).is_concurrency_safe
+            except KeyError:
+                safe = False
+        if safe and batches and batches[-1].concurrent:
+            batches[-1].calls.append(tc)
+        else:
+            batches.append(ToolBatch(concurrent=safe, calls=[tc]))
+    return batches
+
+
+@dataclass
+class _ToolExecResult:
+    block: ToolResultBlock
+    tool_name: str
+
+
+# --------------------------------------------------------------------------- #
+# Agent
+# --------------------------------------------------------------------------- #
+
+
+_ADJECTIVES = [
+    "amber", "brisk", "calm", "deft", "eager", "fleet", "gentle", "honest",
+    "ivory", "jolly", "keen", "lucid", "merry", "noble", "olive", "prime",
+    "quiet", "rapid", "sage", "tidy", "umber", "vivid", "warm", "zesty",
+]
+_NOUNS = [
+    "atlas", "beacon", "cedar", "delta", "ember", "falcon", "grove", "harbor",
+    "iris", "jade", "kite", "lumen", "maple", "nova", "orbit", "pearl",
+    "quartz", "river", "spruce", "talon", "umbra", "vertex", "willow", "zephyr",
+]
+
+
+class Agent:
+    """Drives the ReAct loop and yields AgentEvents."""
+
+    def __init__(
+        self,
+        client: LLMClient,
+        registry: ToolRegistry,
+        protocol: str,
+        *,
+        work_dir: str = ".",
+        max_iterations: int = 50,
+        plan_mode: bool = False,
+        coordinator_mode: bool = False,
+    ) -> None:
+        self.client = client
+        self.registry = registry
+        self.protocol = protocol
+        self.work_dir = work_dir
+        self.max_iterations = max_iterations
+        self.plan_mode = plan_mode
+        self.coordinator_mode = coordinator_mode
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self._plan_path_cache: str | None = None
+
+    # --- plan mode ------------------------------------------------------- #
+
+    def set_plan_mode(self, on: bool) -> None:
+        self.plan_mode = on
+
+    def _get_plan_path(self) -> str:
+        """Lazily generate a readable, single-instance plan file path."""
+        if self._plan_path_cache is None:
+            slug = (
+                f"{random.choice(_ADJECTIVES)}-{random.choice(_NOUNS)}-"
+                f"{datetime.now().strftime('%m%d-%H%M')}"
+            )
+            plans_dir = Path(self.work_dir) / ".mewcode" / "plans"
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            self._plan_path_cache = str(plans_dir / f"{slug}.md")
+        return self._plan_path_cache
+
+    # --- main loop ------------------------------------------------------- #
+
+    async def run(
+        self, conversation: ConversationManager
+    ) -> AsyncIterator[AgentEvent]:
+        iteration = 0
+        consecutive_unknown = 0
+        recoveries = 0
+
+        while True:
+            iteration += 1
+            if iteration > self.max_iterations:
+                yield ErrorEvent(f"Reached max iterations ({self.max_iterations})")
+                return
+
+            if self.plan_mode:
+                plan_path = self._get_plan_path()
+                reminder = build_plan_mode_reminder(
+                    plan_path, Path(plan_path).exists(), iteration
+                )
+                # reminder text already carries <system-reminder> tags
+                conversation.add_user_message(reminder)
+
+            system = build_system_prompt(
+                plan_mode=self.plan_mode, coordinator_mode=self.coordinator_mode
+            )
+            tools = self.registry.get_all_schemas(self.protocol)
+
+            collector = StreamCollector()
+            async for ev in collector.consume(
+                self.client.stream(conversation, system=system, tools=tools)
+            ):
+                yield ev
+            resp = collector.response
+
+            self.total_input_tokens += resp.input_tokens
+            self.total_output_tokens += resp.output_tokens
+            yield UsageEvent(resp.input_tokens, resp.output_tokens)
+
+            # max_tokens escalation / recovery
+            if resp.stop_reason == "max_tokens" and recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
+                recoveries += 1
+                self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
+                conversation.add_assistant_message(
+                    resp.text, thinking_blocks=resp.thinking_blocks
+                )
+                conversation.add_user_message("Continue from where you left off.")
+                yield RetryEvent(reason="max_tokens escalation")
+                continue
+
+            # no tool calls -> done
+            if not resp.tool_calls:
+                conversation.add_assistant_message(
+                    resp.text, thinking_blocks=resp.thinking_blocks
+                )
+                yield LoopComplete(stop_reason="end_turn", iterations=iteration)
+                return
+
+            # write assistant message with its tool_uses
+            conversation.add_assistant_message(
+                resp.text,
+                tool_uses=resp.tool_calls,
+                thinking_blocks=resp.thinking_blocks,
+            )
+
+            # track unknown tools
+            if all(not self.registry.is_enabled(tc.name) for tc in resp.tool_calls):
+                consecutive_unknown += 1
+                if consecutive_unknown >= CONSECUTIVE_UNKNOWN_LIMIT:
+                    yield ErrorEvent("Too many consecutive unknown tool calls")
+                    return
+            else:
+                consecutive_unknown = 0
+
+            # execute, batch by category
+            results: list[ToolResultBlock] = []
+            for batch in partition_tool_calls(resp.tool_calls, self.registry):
+                if batch.concurrent and len(batch.calls) > 1:
+                    execs = await asyncio.gather(
+                        *(self._execute_one(tc) for tc in batch.calls)
+                    )
+                else:
+                    execs = [await self._execute_one(tc) for tc in batch.calls]
+                for ex in execs:
+                    results.append(ex.block)
+                    yield ToolResultEvent(
+                        ex.block.tool_use_id,
+                        ex.tool_name,
+                        ex.block.content,
+                        ex.block.is_error,
+                    )
+
+            conversation.add_tool_results_message(results)
+            yield TurnComplete(iteration=iteration)
+
+    # --- tool execution -------------------------------------------------- #
+
+    async def _execute_one(self, tc: ToolUseBlock) -> _ToolExecResult:
+        """Execute a single tool call into a structured result (never raises)."""
+        # unknown / disabled
+        if not self.registry.is_enabled(tc.name):
+            return _ToolExecResult(
+                ToolResultBlock(tc.id, f"Unknown tool: {tc.name}", is_error=True),
+                tc.name,
+            )
+        tool = self.registry.get(tc.name)
+
+        # Plan Mode: block write/command tools before any side effect.
+        if self.plan_mode and tool.category in {"write", "command"}:
+            return _ToolExecResult(
+                ToolResultBlock(
+                    tc.id,
+                    f"{tc.name} is unavailable in PLAN mode. Run /do to exit "
+                    "plan mode before making changes.",
+                    is_error=True,
+                ),
+                tc.name,
+            )
+
+        try:
+            params = tool.params_model.model_validate(tc.input)
+        except ValidationError as e:
+            return _ToolExecResult(
+                ToolResultBlock(tc.id, f"Parameter validation error: {e}", is_error=True),
+                tc.name,
+            )
+
+        try:
+            result = await tool.execute(params)
+            output, is_error = result.output, result.is_error
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — tool failures must not crash loop
+            output, is_error = f"Tool execution error: {e}", True
+
+        output = _maybe_truncate(output)
+        return _ToolExecResult(
+            ToolResultBlock(tc.id, output, is_error=is_error), tc.name
+        )
+
+
+def _maybe_truncate(output: str) -> str:
+    """Cap a single tool result so it can't blow up the next request."""
+    if len(output) > MAX_OUTPUT_CHARS:
+        return output[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
+    return output
