@@ -1,0 +1,25 @@
+# secrets / local config (commit config.example.yaml instead)
+config.yaml
+.env
+
+# uv virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# MewCode runtime artifacts (plans, session dirs)
+.mewcode/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
