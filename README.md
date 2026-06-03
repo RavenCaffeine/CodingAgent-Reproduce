@@ -25,6 +25,10 @@ write, and edit files, run shell commands, and search the codebase.
   asks for, feeds results back, and repeats until it stops asking — with
   read-concurrent / write-serial batching, a max-iterations cap (50), `/plan`
   mode (read-only planning), and Ctrl-C cancellation.
+- **Modular system prompt**: the system prompt is assembled from priority-ordered
+  sections (identity, safety, tool usage, tone, output style, environment, …);
+  stable rules stay in the cacheable prompt while volatile context (environment
+  info, plan reminders) is injected through the conversation channel.
 
 ## Setup (uv)
 
@@ -124,6 +128,25 @@ exported in the shape each provider expects (Anthropic `input_schema`, OpenAI
 Responses flat function, DeepSeek Chat-Completions nested `function`). Tool
 failures come back as structured errors so the model can retry instead of
 crashing.
+
+## System prompt
+
+The system prompt is built from small, priority-ordered `PromptSection`s
+(`mewcode/prompts.py`) — identity, system context, doing-tasks rules, executing
+actions, tool usage, tone/style, text output, then environment. Later chapters
+add sections (custom instructions, skills, memory) without touching the assembly
+logic. Keeping it deterministic means the stable prefix can be cached by the
+provider.
+
+Volatile context stays out of that stable prefix and rides the **conversation
+channel** instead:
+
+- **Environment context** (working directory, OS, time) is injected once as the
+  first `<system-reminder>` message via `inject_environment`, so changing
+  environment doesn't invalidate the cached prompt.
+- **Plan-mode reminders** are injected per turn (full on the first turn, then a
+  sparse one-liner, full again every few turns) rather than baked into the
+  system prompt.
 
 ## Run
 
