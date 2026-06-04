@@ -274,6 +274,8 @@ class Agent:
         max_iterations: int = 50,
         plan_mode: bool = False,
         coordinator_mode: bool = False,
+        permission_checker: Any = None,
+        ask_permission: Any = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -285,11 +287,32 @@ class Agent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._plan_path_cache: str | None = None
+        # ch06: permission system. `permission_checker.check(tool, args)` returns
+        # a Decision; on "ask" we call the async `ask_permission(tool, args)`
+        # callback (set by the UI) to get a PermissionResponse.
+        self.permission_checker = permission_checker
+        self.ask_permission = ask_permission
 
     # --- plan mode ------------------------------------------------------- #
 
     def set_plan_mode(self, on: bool) -> None:
         self.plan_mode = on
+        # Keep the permission mode in sync so `/mode` reflects plan state (ch06).
+        if self.permission_checker is not None:
+            from mewcode.permissions import PermissionMode
+
+            self.permission_checker.mode = (
+                PermissionMode.PLAN if on else PermissionMode.DEFAULT
+            )
+
+    def set_permission_mode(self, mode) -> None:
+        """Update the permission checker's mode (ch06)."""
+        if self.permission_checker is not None:
+            self.permission_checker.mode = mode
+        # PLAN is also the ch04 plan flag; keep them consistent.
+        from mewcode.permissions import PermissionMode
+
+        self.plan_mode = mode == PermissionMode.PLAN
 
     def _get_plan_path(self) -> str:
         """Lazily generate a readable, single-instance plan file path."""
@@ -302,6 +325,19 @@ class Agent:
             plans_dir.mkdir(parents=True, exist_ok=True)
             self._plan_path_cache = str(plans_dir / f"{slug}.md")
         return self._plan_path_cache
+
+    def _is_plan_target(self, tool, args: dict[str, Any]) -> bool:
+        """True if this write targets the plan file (allowed even in plan mode)."""
+        if tool.name not in ("WriteFile", "EditFile"):
+            return False
+        target = str(args.get("file_path") or args.get("path") or "")
+        if not target:
+            return False
+        norm = target.replace("\\", "/")
+        if ".mewcode/plans/" in norm:
+            return True
+        cached = self._plan_path_cache
+        return bool(cached) and Path(target).name == Path(cached).name
 
     # --- main loop ------------------------------------------------------- #
 
@@ -324,6 +360,8 @@ class Agent:
 
             if self.plan_mode:
                 plan_path = self._get_plan_path()
+                if self.permission_checker is not None:
+                    self.permission_checker.plan_file_path = plan_path
                 reminder = build_plan_mode_reminder(
                     plan_path, Path(plan_path).exists(), iteration
                 )
@@ -415,8 +453,16 @@ class Agent:
             )
         tool = self.registry.get(tc.name)
 
-        # Plan Mode: block write/command tools before any side effect.
-        if self.plan_mode and tool.category in {"write", "command"}:
+        # Plan Mode fallback block — only when there is NO permission checker.
+        # The checker handles plan mode itself (including the plan-file
+        # exemption), so we must not pre-empt it here, otherwise even writing
+        # the plan document would be blocked.
+        if (
+            self.plan_mode
+            and self.permission_checker is None
+            and tool.category in {"write", "command"}
+            and not self._is_plan_target(tool, tc.input)
+        ):
             return _ToolExecResult(
                 ToolResultBlock(
                     tc.id,
@@ -426,6 +472,12 @@ class Agent:
                 ),
                 tc.name,
             )
+
+        # Permission check (ch06): blacklist / sandbox / rules / mode.
+        if self.permission_checker is not None:
+            denied = await self._check_permission(tool, tc)
+            if denied is not None:
+                return denied
 
         try:
             params = tool.params_model.model_validate(tc.input)
@@ -447,6 +499,55 @@ class Agent:
         return _ToolExecResult(
             ToolResultBlock(tc.id, output, is_error=is_error), tc.name
         )
+
+    async def _check_permission(self, tool, tc: ToolUseBlock):
+        """Run the permission check. Returns an error result if denied, else None.
+
+        On `ask`, calls the UI's `ask_permission` callback; `ALLOW_ALWAYS` is
+        self-learned into a local rule.
+        """
+        decision = self.permission_checker.check(tool, tc.input)
+        if decision.effect == "allow":
+            return None
+        if decision.effect == "deny":
+            return _ToolExecResult(
+                ToolResultBlock(
+                    tc.id, f"Permission denied: {decision.reason}", is_error=True
+                ),
+                tc.name,
+            )
+
+        # ask -> hand off to the UI
+        if self.ask_permission is None:
+            return _ToolExecResult(
+                ToolResultBlock(
+                    tc.id,
+                    f"Permission required for {tool.name} but no approver is "
+                    "configured; denied.",
+                    is_error=True,
+                ),
+                tc.name,
+            )
+        response = await self.ask_permission(tool, tc.input)
+        if response == PermissionResponse.DENY:
+            return _ToolExecResult(
+                ToolResultBlock(tc.id, "Permission denied by user", is_error=True),
+                tc.name,
+            )
+        if response == PermissionResponse.ALLOW_ALWAYS:
+            self._self_learn_rule(tool, tc.input)
+        return None
+
+    def _self_learn_rule(self, tool, args: dict[str, Any]) -> None:
+        """Persist an allow rule for this tool+pattern (ALLOW_ALWAYS)."""
+        from mewcode.permissions import Rule, extract_content
+
+        engine = getattr(self.permission_checker, "rule_engine", None)
+        if engine is None:
+            return
+        content = extract_content(tool.name, args)
+        pattern = (content[:60] + "*") if content else "*"
+        engine.append_local_rule(Rule(tool.name, pattern, "allow"))
 
 
 def _maybe_truncate(output: str) -> str:

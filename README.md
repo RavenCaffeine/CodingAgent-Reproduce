@@ -29,6 +29,10 @@ write, and edit files, run shell commands, and search the codebase.
   sections (identity, safety, tool usage, tone, output style, environment, …);
   stable rules stay in the cacheable prompt while volatile context (environment
   info, plan reminders) is injected through the conversation channel.
+- **Permission system (defense in depth)**: a dangerous-command blacklist, a
+  filesystem sandbox, glob allow/deny rules, and permission modes gate every
+  tool call. Unknown cases ask the user (HITL); the blacklist and sandbox are a
+  hard floor that no mode can bypass.
 
 ## Setup (uv)
 
@@ -148,6 +152,32 @@ channel** instead:
   sparse one-liner, full again every few turns) rather than baked into the
   system prompt.
 
+## Permissions
+
+Every tool call passes a layered safety check (`mewcode/permissions/`) before it
+runs:
+
+1. **Dangerous-command blacklist** — `rm -rf /`, fork bombs, `curl | sh`, disk
+   formatting, etc. are denied outright.
+2. **Path sandbox** — file tools are confined to the project root + temp dir;
+   out-of-sandbox paths (resolved through symlinks) are denied.
+3. **Rules** — `ToolName(glob)` allow/deny rules from three YAML files
+   (`~/.mewcode/permissions.yaml` < project `.mewcode/permissions.yaml` <
+   `.mewcode/permissions.local.yaml`; later overrides earlier).
+4. **Permission mode** — falls back to a mode × tool-category matrix.
+
+When nothing decides, MewCode **asks you** (`[y] allow once`, `[A] allow
+always`, `[n] deny`). Choosing *allow always* writes a rule into
+`.mewcode/permissions.local.yaml` so the same call isn't asked again. **The
+blacklist and sandbox are a hard floor** — even `bypass` mode can't run
+`rm -rf /` or escape the sandbox.
+
+Modes: `default` (read allow, write/command ask), `acceptEdits` (writes allow),
+`plan` (read-only), `bypassPermissions` (allow all but the hard floor),
+`dontAsk`, `custom`. Switch with `/mode <name>` or a direct command —
+`/default`, `/acceptEdits`, `/plan`, `/bypassPermissions`, `/dontAsk`, `/custom`.
+`/mode` with no argument shows the current mode and lists them all.
+
 ## Run
 
 ```bash
@@ -162,6 +192,8 @@ uv run python -m mewcode my.yaml    # or an explicit path
 | *(type a message)* | Send it to the agent; it streams the reply and may run tools over multiple rounds. |
 | `/plan` | Enter **plan mode** — read-only. Write/command tools (WriteFile, EditFile, Bash) are blocked; the model investigates and proposes a plan. |
 | `/do` (or `/plan off`) | Leave plan mode and resume normal execution. |
+| `/mode` | Show the current permission mode and list all modes. |
+| `/default` `/acceptEdits` `/plan` `/bypassPermissions` `/dontAsk` `/custom` | Switch directly to that permission mode (or use `/mode <name>`). |
 | `/exit` (or `/quit`, `:q`) | Quit MewCode (prints a token-usage summary). |
 | `Ctrl-C` | Cancel the current turn (mid-stream or mid-tool); the session stays alive. Press it at the prompt to quit. |
 

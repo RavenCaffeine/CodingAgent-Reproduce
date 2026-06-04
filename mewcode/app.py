@@ -20,6 +20,7 @@ from mewcode.conversation import ConversationManager
 from mewcode.agent import (
     Agent,
     ErrorEvent,
+    PermissionResponse,
     LoopComplete,
     RetryEvent,
     StreamText,
@@ -31,6 +32,13 @@ from mewcode.agent import (
 from mewcode.tools import create_default_registry
 from mewcode.tools.ask_user import AskUserTool
 from mewcode.tools.impl.tool_search import ToolSearchTool
+from mewcode.permissions import (
+    DangerousCommandDetector,
+    PathSandbox,
+    PermissionChecker,
+    PermissionMode,
+    RuleEngine,
+)
 
 # ANSI styling (kept tiny; degrades to plain text in dumb terminals).
 _DIM = "\033[2m"
@@ -66,13 +74,119 @@ class MewCodeApp:
             ToolSearchTool(self.registry, protocol=config.protocol)
         )
         self.registry.register(AskUserTool())
+        # ch06: permission system (defense in depth).
+        import os
+        work_dir = os.getcwd()
+        home = os.path.expanduser("~")
+        self.permission_checker = PermissionChecker(
+            DangerousCommandDetector(),
+            PathSandbox(work_dir),
+            RuleEngine(
+                user_rules_path=os.path.join(home, ".mewcode", "permissions.yaml"),
+                project_rules_path=os.path.join(
+                    work_dir, ".mewcode", "permissions.yaml"
+                ),
+                local_rules_path=os.path.join(
+                    work_dir, ".mewcode", "permissions.local.yaml"
+                ),
+            ),
+            mode=PermissionMode.DEFAULT,
+        )
         # ch04: the ReAct Agent Loop drives multi-round tool use.
-        self.agent = Agent(self.client, self.registry, config.protocol)
+        self.agent = Agent(
+            self.client,
+            self.registry,
+            config.protocol,
+            permission_checker=self.permission_checker,
+            ask_permission=self._ask_permission,
+        )
 
     async def _read_line(self, prompt: str) -> str:
         """Read a line without blocking the event loop."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, input, prompt)
+
+    async def _ask_permission(self, tool, args) -> PermissionResponse:
+        """HITL: prompt the user to approve a tool call (ch06)."""
+        from mewcode.permissions import extract_content
+
+        summary = extract_content(tool.name, args) or "(no args)"
+        sys.stdout.write(
+            f"\n{_YELLOW}Permission needed{_RESET} for {_CYAN}{tool.name}{_RESET}: "
+            f"{summary[:80]}\n"
+            f"{_DIM}  [y] allow once  [A] allow always  [n] deny{_RESET}\n"
+        )
+        choice = (await self._read_line(f"{_CYAN}approve? ›{_RESET} ")).strip()
+        if choice == "y":
+            return PermissionResponse.ALLOW
+        if choice == "A":
+            return PermissionResponse.ALLOW_ALWAYS
+        return PermissionResponse.DENY
+
+    _MODE_HELP = {
+        PermissionMode.DEFAULT: "read allow, write/command ask",
+        PermissionMode.ACCEPT_EDITS: "writes allow, command ask",
+        PermissionMode.PLAN: "read-only (no writes/commands)",
+        PermissionMode.BYPASS: "allow all except the hard floor",
+        PermissionMode.DONT_ASK: "never prompt (allow), hard floor still applies",
+        PermissionMode.CUSTOM: "rules-driven, otherwise ask",
+    }
+
+    # accepted spellings for each permission mode (normalized: lowercase,
+    # no '-' / '_'). Used by both `/mode <name>` and the direct `/<name>` cmds.
+    _MODE_ALIASES = {
+        "default": PermissionMode.DEFAULT,
+        "acceptedits": PermissionMode.ACCEPT_EDITS,
+        "accept": PermissionMode.ACCEPT_EDITS,
+        "plan": PermissionMode.PLAN,
+        "bypass": PermissionMode.BYPASS,
+        "bypasspermissions": PermissionMode.BYPASS,
+        "yolo": PermissionMode.BYPASS,
+        "dontask": PermissionMode.DONT_ASK,
+        "custom": PermissionMode.CUSTOM,
+    }
+
+    @staticmethod
+    def _normalize_mode_token(tok: str) -> str:
+        return tok.lower().lstrip("/").replace("-", "").replace("_", "")
+
+    def _set_mode(self, mode: PermissionMode) -> None:
+        """Switch the permission mode, keeping the plan flag in sync (ch06)."""
+        was_plan = self.agent.plan_mode
+        if mode is PermissionMode.PLAN:
+            self.agent.set_plan_mode(True)
+        else:
+            self.agent.set_plan_mode(False)
+            self.permission_checker.mode = mode
+            if was_plan:
+                self.conversation.add_system_reminder(
+                    "Plan mode is now OFF. You may make changes again: "
+                    "WriteFile, EditFile, and Bash are available."
+                )
+        print(f"{_DIM}permission mode → {mode.value}{_RESET}\n")
+
+    def _print_modes(self) -> None:
+        current = self.permission_checker.mode
+        print(f"\n{_DIM}current permission mode:{_RESET} "
+              f"{_CYAN}{current.value}{_RESET}")
+        print(f"{_DIM}available modes:{_RESET}")
+        for m, desc in self._MODE_HELP.items():
+            mark = f"{_GREEN}●{_RESET}" if m is current else f"{_DIM}○{_RESET}"
+            print(f"  {mark} {m.value:<18}{_DIM}{desc}{_RESET}")
+        print(f"{_DIM}switch with: /mode <name>  or  /default /acceptEdits "
+              f"/plan /bypassPermissions /dontAsk{_RESET}\n")
+
+    def _handle_mode(self, user: str) -> None:
+        """`/mode [name]` — show current/all modes, or switch (ch06)."""
+        parts = user.split()
+        if len(parts) == 1:
+            self._print_modes()
+            return
+        mode = self._MODE_ALIASES.get(self._normalize_mode_token(parts[1]))
+        if mode is None:
+            print(f"{_YELLOW}unknown mode: {parts[1]}{_RESET}\n")
+            return
+        self._set_mode(mode)
 
     async def _stream_reply(self) -> None:
         """Drive the Agent Loop for one user turn and render its events."""
@@ -152,9 +266,28 @@ class MewCodeApp:
                 print(f"{_DIM}plan mode ON — read-only; /do to execute.{_RESET}\n")
                 continue
             if user in ("/plan off", "/do"):
+                was_plan = self.agent.plan_mode
                 self.agent.set_plan_mode(False)
+                if was_plan:
+                    # Tell the model plan mode ended so it stops obeying the
+                    # earlier "Plan mode is active" reminders still in history.
+                    self.conversation.add_system_reminder(
+                        "Plan mode is now OFF. You may make changes again: "
+                        "WriteFile, EditFile, and Bash are available. Proceed "
+                        "with the user's request."
+                    )
                 print(f"{_DIM}plan mode OFF.{_RESET}\n")
                 continue
+            if user.startswith("/mode"):
+                self._handle_mode(user)
+                continue
+            # Direct per-mode commands: /default /acceptEdits /bypassPermissions
+            # /dontAsk /custom  (/plan and /do are handled above).
+            if user.startswith("/") and " " not in user:
+                token = self._normalize_mode_token(user)
+                if token in self._MODE_ALIASES and token != "plan":
+                    self._set_mode(self._MODE_ALIASES[token])
+                    continue
             self.conversation.add_user_message(user)
             # Run the turn as a task so ctrl+c cancels the loop cleanly.
             task = asyncio.ensure_future(self._stream_reply())
