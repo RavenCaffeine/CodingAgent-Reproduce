@@ -24,6 +24,9 @@
 - **模块化系统提示词**：system prompt 由按优先级排序的多段拼装（身份、安全、工具
   使用、语气、输出风格、环境……）；稳定规则留在可缓存的提示词里，易变内容（环境
   信息、plan 提醒）走对话通道注入，不让缓存失效。
+- **权限系统（纵深防御）**：危险命令黑名单、文件路径沙箱、`ToolName(glob)` 放行/拒绝
+  规则、多档权限模式，逐层把关每次工具调用。没明确命中就交给用户决定（HITL）；黑名单
+  与沙箱是硬底线，任何档位都绕不过。
 
 ## 安装（uv）
 
@@ -131,6 +134,26 @@ System prompt 由一组按优先级排序的小段 `PromptSection`（`mewcode/pr
 - **Plan 模式提醒**按轮注入（首轮完整、之后稀疏一行、每隔几轮再完整），而不是写死
   进 system prompt。
 
+## 权限
+
+每次工具调用执行前都要过一层纵深安全检查（`mewcode/permissions/`）：
+
+1. **危险命令黑名单** —— `rm -rf /`、fork 炸弹、`curl | sh`、磁盘格式化等直接拒绝。
+2. **路径沙箱** —— 文件类工具只能落在项目根 + 临时目录内；越界路径（含软链解析后）拒绝。
+3. **规则** —— `ToolName(glob)` 的 allow/deny 规则，来自三层 YAML
+   （`~/.mewcode/permissions.yaml` < 项目 `.mewcode/permissions.yaml` <
+   `.mewcode/permissions.local.yaml`，后者覆盖前者）。
+4. **权限模式** —— 落到「模式 × 工具类别」矩阵兜底。
+
+都没决定时 MewCode 会**问你**（`[y] 本次允许`、`[A] 永久允许`、`[n] 拒绝`）。选
+*永久允许* 会把一条规则写进 `.mewcode/permissions.local.yaml`，同类调用以后不再问。
+**黑名单和沙箱是硬底线**——即便 `bypass` 档也跑不了 `rm -rf /`、逃不出沙箱。
+
+档位：`default`（读放行、写/命令询问）、`acceptEdits`（写放行）、`plan`（只读）、
+`bypassPermissions`（除硬底线外全放）、`dontAsk`、`custom`。用 `/mode <名称>` 或直接
+命令切换——`/default`、`/acceptEdits`、`/plan`、`/bypassPermissions`、`/dontAsk`、
+`/custom`。`/mode`（无参）显示当前档位并列出全部。
+
 ## 运行
 
 ```bash
@@ -145,6 +168,8 @@ uv run python -m mewcode my.yaml    # 或指定路径
 | *（直接输入消息）* | 发给 agent；它会流式回复，并可能跨多轮调用工具。 |
 | `/plan` | 进入**规划模式**（只读）。写/命令类工具（WriteFile、EditFile、Bash）被拦截，模型只调研并给出计划。 |
 | `/do`（或 `/plan off`） | 退出规划模式，恢复正常执行。 |
+| `/mode` | 查看当前权限档位并列出全部档位。 |
+| `/default` `/acceptEdits` `/plan` `/bypassPermissions` `/dontAsk` `/custom` | 直接切到对应权限档位（也可用 `/mode <名称>`）。 |
 | `/exit`（或 `/quit`、`:q`） | 退出 MewCode（打印 token 用量小结）。 |
 | `Ctrl-C` | 取消当前回合（流式中或工具执行中），会话不退出；在输入提示符处按则退出程序。 |
 
