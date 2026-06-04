@@ -55,3 +55,21 @@ thinking: false                      # OpenAI ignores / OpenAI 忽略此项
 # base_url: https://api.deepseek.com  # optional, this is the default / 可选，默认值
 # api_key: ${DEEPSEEK_API_KEY}        # or literal / 或明文: sk-xxxxx
 # thinking: false                     # reasoning streams auto / reasoning 自动流式
+
+
+# ---------------------------------------------------------------------------
+# MCP servers / 外部 MCP 服务器 (optional / 可选, ch07)
+#   Connected at startup; each server's tools appear as mcp_<server>_<tool>.
+#   启动时连接；每个 server 的工具以 mcp_<server>_<tool> 形式注册。
+#   Declare exactly ONE transport per server / 每个 server 只能选一种传输:
+#     stdio:  command + args (+ env)   |   http: url (+ headers)
+#   headers/env values support ${VAR} expansion / 支持 ${VAR} 环境变量展开
+# ---------------------------------------------------------------------------
+# mcp_servers:
+#   context7:                          # stdio: local subprocess / 本地子进程
+#     command: npx
+#     args: ["-y", "@upstash/context7-mcp"]
+#   remote:                            # http: Streamable HTTP / 远程
+#     url: https://example.com/mcp
+#     headers:
+#       Authorization: "Bearer ${MCP_TOKEN}"

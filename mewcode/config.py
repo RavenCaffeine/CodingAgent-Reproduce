@@ -8,6 +8,7 @@ the output-token budgets the client requests.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 
 # Hard ceiling the Agent Loop may escalate to when a turn ends on
@@ -17,6 +18,87 @@ MAX_TOKENS_CEILING = 128000
 # Default budgets (see N5 in spec.md).
 _THINKING_DEFAULT_TOKENS = 64000
 _PLAIN_DEFAULT_TOKENS = 8192
+
+
+class ConfigError(ValueError):
+    """Raised when a config file is structurally invalid."""
+
+
+# Host env vars safe to pass through to MCP stdio child processes. API keys and
+# other secrets are deliberately excluded — a child server gets only these plus
+# whatever the config explicitly declares (see build_child_env).
+_CHILD_ENV_WHITELIST = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "PATHEXT",
+    "COMSPEC",
+)
+
+_ENV_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def resolve_env_vars(mapping: dict[str, str]) -> dict[str, str]:
+    """Expand ``${VAR}`` / ``$VAR`` inside a mapping's values from os.environ.
+
+    Used for MCP HTTP headers and stdio env so API keys can be referenced as
+    ``Authorization: "Bearer ${MCP_TOKEN}"``. Missing variables expand to "".
+    """
+
+    def _sub(value: str) -> str:
+        def repl(m: "re.Match[str]") -> str:
+            name = m.group(1) or m.group(2)
+            return os.environ.get(name, "")
+
+        return _ENV_VAR_RE.sub(repl, value)
+
+    return {k: _sub(v) if isinstance(v, str) else v for k, v in mapping.items()}
+
+
+def build_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a minimal env for an MCP stdio child: whitelist + explicit extras.
+
+    Host secrets (e.g. ANTHROPIC_API_KEY) are NOT inherited — only the
+    whitelist below, plus whatever ``extra`` the server config declares.
+    """
+    env: dict[str, str] = {}
+    for key in _CHILD_ENV_WHITELIST:
+        if key in os.environ:
+            env[key] = os.environ[key]
+    if extra:
+        env.update(extra)
+    return env
+
+
+@dataclass
+class MCPServerConfig:
+    """One external MCP server. Either stdio (command) or HTTP (url), never both.
+
+    Attributes:
+        name: Server label; becomes the ``mcp_<name>_<tool>`` prefix.
+        command/args/env: stdio transport — child process + its argv + env.
+        url/headers: Streamable HTTP transport — endpoint + request headers.
+        timeout: Per-request timeout in seconds.
+    """
+
+    name: str
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    timeout: float = 30.0
+
+    @property
+    def is_stdio(self) -> bool:
+        return self.command is not None
 
 
 @dataclass
@@ -46,6 +128,8 @@ class ProviderConfig:
     thinking: bool = False
     max_output_tokens: int | None = None
     extra: dict = field(default_factory=dict)
+    # ch07: external MCP servers to connect at startup.
+    mcp_servers: list["MCPServerConfig"] = field(default_factory=list)
 
     def resolve_api_key(self) -> str | None:
         """Resolve the API key: literal first, then environment variable."""
@@ -139,4 +223,53 @@ def load_config(path: str | os.PathLike) -> ProviderConfig:
         base_url=base_url,
         thinking=bool(data.get("thinking", False)),
         max_output_tokens=data.get("max_output_tokens"),
+        mcp_servers=_parse_mcp_servers(data.get("mcp_servers")),
     )
+
+
+def _parse_mcp_servers(raw: object) -> list[MCPServerConfig]:
+    """Deserialize the ``mcp_servers`` mapping into MCPServerConfig list.
+
+    Shape (key = server name)::
+
+        mcp_servers:
+          context7:
+            command: npx
+            args: ["-y", "@upstash/context7-mcp"]
+          remote:
+            url: https://example.com/mcp
+            headers: { Authorization: "Bearer ${MCP_TOKEN}" }
+
+    Each entry must declare exactly one transport: ``command`` (stdio) or
+    ``url`` (HTTP) — never both, never neither (raises ConfigError).
+    """
+    if not raw:
+        return []
+    if not isinstance(raw, dict):
+        raise ConfigError("config: 'mcp_servers' must be a mapping of name -> server")
+
+    servers: list[MCPServerConfig] = []
+    for name, entry in raw.items():
+        entry = entry or {}
+        command = entry.get("command")
+        url = entry.get("url")
+        if command and url:
+            raise ConfigError(
+                f"mcp_servers['{name}'] cannot have both 'command' and 'url'"
+            )
+        if not command and not url:
+            raise ConfigError(
+                f"mcp_servers['{name}'] must have either 'command' or 'url'"
+            )
+        servers.append(
+            MCPServerConfig(
+                name=name,
+                command=command,
+                args=list(entry.get("args") or []),
+                url=url,
+                headers=dict(entry.get("headers") or {}),
+                env=dict(entry.get("env") or {}),
+                timeout=float(entry.get("timeout", 30.0)),
+            )
+        )
+    return servers
