@@ -27,12 +27,16 @@
 - **权限系统（纵深防御）**：危险命令黑名单、文件路径沙箱、`ToolName(glob)` 放行/拒绝
   规则、多档权限模式，逐层把关每次工具调用。没明确命中就交给用户决定（HITL）；黑名单
   与沙箱是硬底线，任何档位都绕不过。
+- **MCP 客户端**：启动时连接外部 [Model Context Protocol](https://modelcontextprotocol.io)
+  服务器（stdio 或 Streamable HTTP），把远端工具以 `mcp_<server>_<tool>` 注册，
+  和内置工具并列，并同样要过权限检查。
 
 ## 安装（uv）
 
 使用 [uv](https://docs.astral.sh/uv/) 管理环境。依赖写在 `requirements.txt` 里
-（`anthropic`、`openai`、`pyyaml`、`pydantic` + 开发工具），方便后续增添。无系统
-依赖 —— Glob/Grep 是纯 Python 实现。
+（`anthropic`、`openai`、`pyyaml`、`pydantic`、`mcp`、`httpx` + 开发工具），方便后续
+增添。无系统依赖 —— Glob/Grep 是纯 Python 实现（MCP stdio server 可能需要自己的运行时，
+如 `npx`）。
 
 ```bash
 uv venv                              # 创建 .venv
@@ -54,7 +58,8 @@ copy config.example.yaml config.yaml # win
 四个核心字段 —— `protocol` / `model` / `base_url` / `api_key`，外加可选的
 `thinking`。只让一组 provider 处于启用状态，其余整段注释掉。`create_client` 按
 `protocol` 路由，所以切换 provider 只改配置、不动代码。三套配置并排见
-`config.example.yaml`。
+`config.example.yaml`。还有一个可选的 `mcp_servers` 段用来连接外部 MCP 服务器——见
+下文 [MCP 服务器](#mcp-服务器)。
 
 **Anthropic Claude：**
 
@@ -153,6 +158,40 @@ System prompt 由一组按优先级排序的小段 `PromptSection`（`mewcode/pr
 `bypassPermissions`（除硬底线外全放）、`dontAsk`、`custom`。用 `/mode <名称>` 或直接
 命令切换——`/default`、`/acceptEdits`、`/plan`、`/bypassPermissions`、`/dontAsk`、
 `/custom`。`/mode`（无参）显示当前档位并列出全部。
+
+## MCP 服务器
+
+MewCode 能连接外部 [MCP](https://modelcontextprotocol.io) 服务器，把它们的工具暴露给
+模型。在 `config.yaml` 的 `mcp_servers` 下声明（key 为 server 名）；每个 server **只能选
+一种**传输——`command`（stdio 子进程）或 `url`（Streamable HTTP）。`headers` 与 `env`
+的值支持 `${VAR}` 环境变量展开。
+
+```yaml
+mcp_servers:
+  context7:                       # stdio：本地子进程
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+  remote:                         # http：Streamable HTTP
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_TOKEN}"
+    timeout: 30                   # 可选，秒（默认 30）
+```
+
+| 字段 | 传输 | 含义 |
+|------|------|------|
+| `command` | stdio | 启动 server 的可执行文件（与 `url` 互斥）。 |
+| `args` | stdio | `command` 的参数列表。 |
+| `env` | stdio | 传给子进程的额外环境变量（合并到安全白名单上）。 |
+| `url` | http | Streamable HTTP 端点（与 `command` 互斥）。 |
+| `headers` | http | 请求头；值支持 `${VAR}` 展开。 |
+| `timeout` | 两者 | 单请求超时（秒，默认 30）。 |
+
+启动时 MewCode 并发连接所有 server，把每个工具注册为 `mcp_<server>_<tool>`，并打印
+`Connected to N MCP server(s), M tools registered`。某个 server 连接失败只打警告并跳过，
+其余照常加载。发现到的工具是 deferred 的，模型通过 `ToolSearch` 找到后即可像内置工具一样
+调用（同样要过权限检查）。stdio 子进程只继承一份小白名单 env 加你声明的 `env`——
+`ANTHROPIC_API_KEY` 等宿主机敏感变量绝不透传。
 
 ## 运行
 

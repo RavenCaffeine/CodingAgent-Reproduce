@@ -33,12 +33,17 @@ write, and edit files, run shell commands, and search the codebase.
   filesystem sandbox, glob allow/deny rules, and permission modes gate every
   tool call. Unknown cases ask the user (HITL); the blacklist and sandbox are a
   hard floor that no mode can bypass.
+- **MCP client**: connects external [Model Context Protocol](https://modelcontextprotocol.io)
+  servers at startup (stdio or Streamable HTTP) and exposes their tools as
+  `mcp_<server>_<tool>`, alongside the built-ins — and they pass the same
+  permission checks.
 
 ## Setup (uv)
 
 Uses [uv](https://docs.astral.sh/uv/) for the environment. Dependencies live in
-`requirements.txt` (`anthropic`, `openai`, `pyyaml`, `pydantic` + dev tools) so
-new ones are easy to add. No system dependencies — Glob/Grep are pure Python.
+`requirements.txt` (`anthropic`, `openai`, `pyyaml`, `pydantic`, `mcp`, `httpx`
++ dev tools) so new ones are easy to add. No system dependencies — Glob/Grep are
+pure Python (MCP stdio servers may need their own runtime, e.g. `npx`).
 
 ```bash
 uv venv                              # create .venv
@@ -60,6 +65,8 @@ Four core fields — `protocol` / `model` / `base_url` / `api_key` — plus an
 optional `thinking`. Keep exactly one provider block active; comment the others
 out. `create_client` routes by `protocol`, so switching provider is config-only
 (no code change). See `config.example.yaml` for all three blocks side by side.
+An optional `mcp_servers` block connects external MCP servers — see
+[MCP servers](#mcp-servers) below.
 
 **Anthropic Claude:**
 
@@ -177,6 +184,46 @@ Modes: `default` (read allow, write/command ask), `acceptEdits` (writes allow),
 `dontAsk`, `custom`. Switch with `/mode <name>` or a direct command —
 `/default`, `/acceptEdits`, `/plan`, `/bypassPermissions`, `/dontAsk`, `/custom`.
 `/mode` with no argument shows the current mode and lists them all.
+
+## MCP servers
+
+MewCode can connect external [MCP](https://modelcontextprotocol.io) servers and
+expose their tools to the model. Declare them under `mcp_servers` in your
+`config.yaml` (key = server name); each server uses **exactly one** transport —
+`command` (stdio subprocess) or `url` (Streamable HTTP). `headers` and `env`
+values support `${VAR}` expansion.
+
+```yaml
+mcp_servers:
+  context7:                       # stdio: local subprocess
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    env:                          # optional; passed to the child process
+      LOG_LEVEL: info
+  remote:                         # http: Streamable HTTP
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_TOKEN}"
+    timeout: 30                   # optional, seconds (default 30)
+```
+
+| Field | Transport | Meaning |
+|-------|-----------|---------|
+| `command` | stdio | Executable to launch the server (mutually exclusive with `url`). |
+| `args` | stdio | Argument list for `command`. |
+| `env` | stdio | Extra env for the child (merged onto a safe whitelist). |
+| `url` | http | Streamable HTTP endpoint (mutually exclusive with `command`). |
+| `headers` | http | Request headers; values support `${VAR}`. |
+| `timeout` | both | Per-request timeout in seconds (default 30). |
+
+At startup MewCode connects every server concurrently, registers each tool as
+`mcp_<server>_<tool>`, and prints `Connected to N MCP server(s), M tools
+registered`. A server that fails to connect only logs a warning and is skipped —
+the rest still load. Discovered tools are deferred, so the model finds them via
+`ToolSearch` and then calls them like any built-in (they go through the same
+permission checks). stdio child processes inherit only a small env whitelist plus
+the `env` you declare — host secrets like `ANTHROPIC_API_KEY` are never passed
+through.
 
 ## Run
 

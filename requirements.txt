@@ -4,6 +4,10 @@ openai>=1.40
 pyyaml>=6.0
 pydantic>=2.0
 
+# ch07: MCP client (official SDK + Streamable HTTP transport)
+mcp>=1.0
+httpx>=0.27
+
 # dev / test
 pytest>=8.0
 pytest-asyncio>=0.23

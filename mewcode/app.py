@@ -100,6 +100,9 @@ class MewCodeApp:
             permission_checker=self.permission_checker,
             ask_permission=self._ask_permission,
         )
+        # ch07: external MCP servers (connected lazily at run() start).
+        self._mcp_server_configs = list(getattr(config, "mcp_servers", []) or [])
+        self.mcp_manager = None
 
     async def _read_line(self, prompt: str) -> str:
         """Read a line without blocking the event loop."""
@@ -241,12 +244,54 @@ class MewCodeApp:
         except LLMError as e:
             sys.stdout.write(f"\n{_YELLOW}[error] {e}{_RESET}\n")
 
+    async def _init_mcp(self) -> None:
+        """Connect configured MCP servers and register their tools (ch07)."""
+        if not self._mcp_server_configs:
+            return
+        from mewcode.mcp import MCPManager
+
+        self.mcp_manager = MCPManager()
+        self.mcp_manager.load_configs(self._mcp_server_configs)
+        n = len(self._mcp_server_configs)
+        print(f"{_DIM}Connecting to {n} MCP server(s)…{_RESET}")
+        errors = await self.mcp_manager.register_all_tools(self.registry)
+        mcp_tools = [
+            t for t in self.registry.list_tools() if t.name.startswith("mcp_")
+        ]
+        connected = n - len(errors)
+        print(
+            f"{_DIM}Connected to {connected} MCP server(s), "
+            f"{len(mcp_tools)} tools registered.{_RESET}"
+        )
+        for err in errors:
+            print(f"{_YELLOW}  MCP server failed — {err}{_RESET}")
+        if mcp_tools:
+            listing = ", ".join(t.name for t in mcp_tools)
+            self.conversation.add_system_reminder(
+                "External MCP tools are available (discover them via ToolSearch "
+                f"before use): {listing}"
+            )
+        print()
+
+    async def _shutdown_mcp(self) -> None:
+        """Tear down all MCP connections (ch07). Idempotent."""
+        if self.mcp_manager is not None:
+            await self.mcp_manager.shutdown()
+            self.mcp_manager = None
+
     async def run(self) -> None:
         print(_BANNER)
         print(
             f"{_DIM}provider={self.config.name} protocol={self.config.protocol} "
             f"model={self.config.model} thinking={self.config.thinking}{_RESET}\n"
         )
+        await self._init_mcp()
+        try:
+            await self._run_loop()
+        finally:
+            await self._shutdown_mcp()
+
+    async def _run_loop(self) -> None:
         while True:
             try:
                 user = (await self._read_line(f"{_CYAN}you ›{_RESET} ")).strip()
