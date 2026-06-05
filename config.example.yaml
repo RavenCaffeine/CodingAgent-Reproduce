@@ -12,8 +12,9 @@
 #   base_url  endpoint (optional) / 请求地址（可选）
 #   api_key   auth / 认证                    see "API key" note below / 见下方说明
 # Optional / 可选:
-#   thinking  extended thinking / 扩展思考    Anthropic & DeepSeek; OpenAI ignores
-#   name      display label / 显示名
+#   thinking        extended thinking / 扩展思考  Anthropic & DeepSeek; OpenAI ignores
+#   name            display label / 显示名
+#   context_window  auto-compaction window / 自动压缩窗口   default 200000 / 默认 200000
 #
 # ── API key: 3 ways / 三种写法 (pick one / 任选其一) ─────────────────────────
 #   1) manual literal / 手动填入:  api_key: sk-xxxxx
@@ -34,6 +35,7 @@
 # base_url: https://api.anthropic.com  # optional / 可选
 # api_key: ${ANTHROPIC_API_KEY}        # or literal / 或明文: sk-ant-xxxxx
 # thinking: true                       # adaptive on opus/sonnet-4-6+ / 否则固定 budget
+# context_window: 200000               # ch08: auto-compaction threshold base / 自动压缩阈值的窗口
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,8 @@ model: gpt-4.1                       # e.g. gpt-4.1 / gpt-4o / o4-mini
 base_url: https://api.openai.com/v1  # optional / 可选
 api_key: ${OPENAI_API_KEY}           # or literal / 或明文: sk-xxxxx
 thinking: false                      # OpenAI ignores / OpenAI 忽略此项
+context_window: 200000               # ch08: auto-compaction threshold base /
+                                     # 自动压缩阈值的窗口；预算小（如紧的 TPM 限制）就调小
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,7 @@ thinking: false                      # OpenAI ignores / OpenAI 忽略此项
 # base_url: https://api.deepseek.com  # optional, this is the default / 可选，默认值
 # api_key: ${DEEPSEEK_API_KEY}        # or literal / 或明文: sk-xxxxx
 # thinking: false                     # reasoning streams auto / reasoning 自动流式
+# context_window: 128000              # ch08: auto-compaction threshold base / 自动压缩阈值的窗口
 
 
 # ---------------------------------------------------------------------------

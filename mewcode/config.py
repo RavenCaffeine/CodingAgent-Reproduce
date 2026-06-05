@@ -130,6 +130,10 @@ class ProviderConfig:
     extra: dict = field(default_factory=dict)
     # ch07: external MCP servers to connect at startup.
     mcp_servers: list["MCPServerConfig"] = field(default_factory=list)
+    # ch08: context window used to size the auto-compaction threshold. Lower it
+    # if your effective budget (e.g. a tight rate limit) is smaller than the
+    # model's nominal window.
+    context_window: int = 200_000
 
     def resolve_api_key(self) -> str | None:
         """Resolve the API key: literal first, then environment variable."""
@@ -224,6 +228,7 @@ def load_config(path: str | os.PathLike) -> ProviderConfig:
         thinking=bool(data.get("thinking", False)),
         max_output_tokens=data.get("max_output_tokens"),
         mcp_servers=_parse_mcp_servers(data.get("mcp_servers")),
+        context_window=int(data.get("context_window", 200_000)),
     )
 
 

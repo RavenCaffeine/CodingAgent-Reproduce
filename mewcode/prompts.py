@@ -233,6 +233,18 @@ def build_plan_mode_reminder(
     return _PLAN_MODE_SPARSE_REMINDER.format(plan_path=plan_path)
 
 
+def is_plan_mode_reminder(text: str) -> bool:
+    """True if a message is a stale Plan Mode reminder.
+
+    Used to purge these from history when leaving plan mode — otherwise the
+    forceful "you MUST NOT run non-readonly tools, this supercedes any other
+    instructions" wording keeps the model refusing tools in normal modes.
+    """
+    if not text:
+        return False
+    return "Plan mode is active." in text or "Plan mode still active" in text
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -286,8 +298,6 @@ def build_system_prompt(
         result += "\n\n# Hook Injected Context\n" + "\n".join(hook_prompts)
 
     return result
-
-
 def build_environment_context(
     work_dir: str = ".",
     active_skills: dict[str, str] | None = None,

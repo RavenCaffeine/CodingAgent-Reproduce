@@ -19,10 +19,12 @@ from mewcode.cache import FileCache
 from mewcode.conversation import ConversationManager
 from mewcode.agent import (
     Agent,
+    CompactNotification,
     ErrorEvent,
     PermissionResponse,
     LoopComplete,
     RetryEvent,
+    SpillNotification,
     StreamText,
     ThinkingText,
     ToolResultEvent,
@@ -55,6 +57,40 @@ _BANNER = f"""{_CYAN}
 |_|  |_|\\___| \\_/\\_/   \\____\\___/ \\__,_|\\___|
 {_RESET}  terminal AI assistant — type your message, /exit to quit
 """
+
+# Per-tool "primary argument" used to render a one-line summary of a tool call,
+# e.g. `Bash: find . -name "*.go"` or `ReadFile: mewcode/agent.py`.
+_TOOL_ARG_KEYS = {
+    "Bash": "command",
+    "ReadFile": "file_path",
+    "WriteFile": "file_path",
+    "EditFile": "file_path",
+    "Glob": "pattern",
+    "Grep": "pattern",
+    "ToolSearch": "query",
+    "AskUserQuestion": "question",
+}
+_TOOL_ARG_MAX = 80
+
+
+def _summarize_tool_args(name: str, args: dict) -> str:
+    """One-line summary of a tool call's key argument (command / file / pattern)."""
+    if not args:
+        return ""
+    key = _TOOL_ARG_KEYS.get(name)
+    value = ""
+    if key and args.get(key):
+        value = str(args[key])
+    else:
+        # fallback: first non-empty arg value (covers MCP / unknown tools)
+        for v in args.values():
+            if v not in (None, "", [], {}):
+                value = str(v)
+                break
+    value = " ".join(value.split())  # collapse whitespace/newlines
+    if len(value) > _TOOL_ARG_MAX:
+        value = value[: _TOOL_ARG_MAX - 1] + "…"
+    return value
 
 
 class MewCodeApp:
@@ -99,6 +135,7 @@ class MewCodeApp:
             config.protocol,
             permission_checker=self.permission_checker,
             ask_permission=self._ask_permission,
+            context_window=getattr(config, "context_window", 200_000),
         )
         # ch07: external MCP servers (connected lazily at run() start).
         self._mcp_server_configs = list(getattr(config, "mcp_servers", []) or [])
@@ -218,15 +255,29 @@ class MewCodeApp:
                     if in_thinking:
                         sys.stdout.write(_RESET)
                         in_thinking = False
-                    sys.stdout.write(f"\n{_DIM}[tool] {event.tool_name}…{_RESET}\n")
+                    summary = _summarize_tool_args(event.tool_name, event.arguments)
+                    label = (
+                        f"{event.tool_name}: {summary}" if summary
+                        else event.tool_name
+                    )
+                    sys.stdout.write(f"\n{_DIM}[tool] {label}{_RESET}\n")
                     sys.stdout.flush()
                     printed_prefix = False
                 elif isinstance(event, ToolResultEvent):
-                    tag = (
-                        f"{_YELLOW}error{_RESET}" if event.is_error
-                        else f"{_GREEN}ok{_RESET}"
+                    mark = (
+                        f"{_YELLOW}✗{_RESET}" if event.is_error
+                        else f"{_GREEN}✓{_RESET}"
                     )
-                    sys.stdout.write(f"{_DIM}  └ {event.tool_name} [{tag}{_DIM}]{_RESET}\n")
+                    sys.stdout.write(f"{_DIM}  └ {mark}{_DIM} {event.tool_name}{_RESET}\n")
+                    sys.stdout.flush()
+                elif isinstance(event, SpillNotification):
+                    sys.stdout.write(
+                        f"{_DIM}◇ spilled {event.count} tool result(s) to disk "
+                        f"(~{event.freed_chars} chars freed){_RESET}\n"
+                    )
+                    sys.stdout.flush()
+                elif isinstance(event, CompactNotification):
+                    sys.stdout.write(f"{_DIM}◇ {event.message}{_RESET}\n")
                     sys.stdout.flush()
                 elif isinstance(event, RetryEvent):
                     sys.stdout.write(f"{_DIM}↻ retrying: {event.reason}{_RESET}\n")
@@ -279,6 +330,31 @@ class MewCodeApp:
             await self.mcp_manager.shutdown()
             self.mcp_manager = None
 
+    async def _handle_compact(self) -> None:
+        """Manually trigger Layer 2 context compaction (/compact, ch08)."""
+        from mewcode.context.manager import (
+            CompactEvent,
+            compute_compact_threshold,
+        )
+
+        window = self.agent.context_window
+        threshold = compute_compact_threshold(window)
+        tokens = self.conversation.last_input_tokens
+        print(
+            f"{_DIM}当前 context_window={window}，自动压缩阈值={threshold}"
+            f"（上次请求 {tokens} tokens）{_RESET}"
+        )
+        # Let manual_compact decide: it summarizes the older part if any exists.
+        # A short conversation that all fits in the keep-recent tail has nothing
+        # to summarize, and manual_compact reports that reason.
+        result = await self.agent.manual_compact(self.conversation)
+        if isinstance(result, CompactEvent):
+            print(
+                f"{_DIM}上下文已压缩（压缩前 {result.before_tokens} tokens）。{_RESET}\n"
+            )
+        else:
+            print(f"{_DIM}{result}{_RESET}\n")
+
     async def run(self) -> None:
         print(_BANNER)
         print(
@@ -322,6 +398,9 @@ class MewCodeApp:
                         "with the user's request."
                     )
                 print(f"{_DIM}plan mode OFF.{_RESET}\n")
+                continue
+            if user in ("/compact", "/c"):
+                await self._handle_compact()
                 continue
             if user.startswith("/mode"):
                 self._handle_mode(user)

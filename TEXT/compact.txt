@@ -1,0 +1,188 @@
+1. Claude Code 的上下文里到底有什么？
+
+Claude Code 的 context window 不是只有聊天记录，它会装很多东西：
+
+系统提示词 / output style
+用户输入
+Claude 自己之前的回复
+读取过的文件内容
+工具调用结果
+CLAUDE.md / CLAUDE.local.md
+auto memory
+MCP 工具描述
+Skill 描述和被调用后的 Skill body
+rules / hooks 相关信息
+Subagent 返回的摘要
+
+官方文档说，Claude Code 的上下文窗口保存了它在当前 session 中“知道”的所有内容，包括你的指令、它读取的文件、它自己的回复，以及一些不会直接显示在终端里的内容。启动前还会自动加载 CLAUDE.md、auto memory、MCP tool names、skill descriptions 等。
+
+所以你可以把它理解成：
+
+每一轮调用模型时，Claude Code 会组装一个大 prompt：
+系统规则 + 项目记忆 + 当前任务 + 历史对话 + 文件内容 + 工具结果 + 其他运行时信息
+2. 自动压缩 Auto-Compact 是怎么做的？
+
+核心机制是：
+
+上下文快满了
+      ↓
+Claude Code 触发 compact
+      ↓
+把旧对话 / 旧工具结果 / 旧文件阅读内容总结成结构化摘要
+      ↓
+用摘要替换原来的长历史
+      ↓
+继续当前 session
+
+Claude Code 官方文档说：当上下文接近限制时，会自动 compact；这个自动过程和你手动运行 /compact 的效果类似。
+
+Anthropic API 的 compaction 文档也描述了类似流程：检测输入 token 是否超过阈值，生成当前对话摘要，创建 compaction block，然后后续请求会丢弃 compaction block 之前的消息块，从摘要继续。
+
+所以它不是简单地“删掉前面的消息”，而是：
+
+旧上下文 → 摘要 → 保留下来
+
+但注意：摘要一定会损失细节。比如某个 bug 的精确报错、某段代码的微小差异、你临时说过的偏好，都可能被压没。
+
+3. /compact 和 Auto-Compact 的区别
+
+区别主要是谁来决定压缩重点。
+
+Auto-Compact
+
+系统自动触发，Claude Code 自己猜哪些重要。
+
+# 不需要你操作
+# 上下文快满时自动发生
+
+优点：不会因为上下文爆掉而直接中断。
+
+缺点：它可能把你认为重要的东西总结丢。
+
+手动 /compact
+
+你可以提前压缩，并告诉它重点保留什么。
+
+/compact focus on the auth bug fix and preserve current TODO list
+
+官方也建议在开始长任务前可以手动 /compact，并带上 focus instruction，这样 summary 会更贴近你想保留的内容，而不是让自动压缩自己猜。
+
+4. 什么内容会在压缩后保留？
+
+官方给了很重要的表格。压缩后不同来源的内容命运不同：
+
+内容来源	compact 后会怎样
+System prompt / output style	不变，因为它不属于普通消息历史
+项目根目录 CLAUDE.md / unscoped rules	会从磁盘重新注入
+Auto memory	会从磁盘重新注入
+带 paths: 的 path-scoped rules	会丢失，直到再次读取匹配文件
+子目录里的 nested CLAUDE.md	会丢失，直到再次读取该目录文件
+已调用 Skill body	会重新注入，但有 token 上限
+Hooks	不作为上下文保存，它们是代码执行机制
+
+Skill body 的规则也很具体：压缩后会重新注入，但每个 skill 最多 5,000 tokens，总共最多 25,000 tokens，超过后旧的会先被丢弃。
+
+这点很关键：不是所有东西都会被摘要保留，有些东西靠“重新加载”，有些东西靠“摘要”，有些东西会暂时消失。
+
+5. 那所谓“七层”可能指什么？
+
+如果你看到有人说 Claude Code 有“七层上下文压缩”，大概率是在把 Claude Code 的上下文管理拆成类似下面几层：
+
+第 1 层：只加载必要启动信息
+第 2 层：CLAUDE.md / rules / memory 作为长期项目记忆
+第 3 层：按需读取文件，而不是一次性塞整个仓库
+第 4 层：path-scoped rules / nested CLAUDE.md 懒加载
+第 5 层：Subagent 用独立上下文处理大任务，只把摘要带回主上下文
+第 6 层：手动 /compact，把旧历史总结成摘要
+第 7 层：Auto-Compact，快爆上下文时自动压缩
+
+这个“七层”作为教学模型可以用，但要注意：
+
+官方并没有说 Claude Code 的压缩机制就是固定七层。
+
+更准确地说，它是：
+
+上下文节流 + 按需加载 + 子代理隔离 + 持久记忆 + 自动摘要压缩
+6. 用一个例子理解
+
+假设你让 Claude Code 改一个 React + Python 后端项目。
+
+一开始：
+
+加载：
+- system prompt
+- CLAUDE.md
+- auto memory
+- MCP 工具描述
+- skill 描述
+
+你让它读文件：
+
+读了 backend/app.py
+读了 frontend/src/App.tsx
+读了 package.json
+读了报错日志
+
+这些内容都会进入上下文。
+
+做着做着上下文快满了：
+
+Auto-Compact 触发
+
+然后 Claude Code 会把之前的内容压成类似：
+
+当前任务：修复前后端一键启动问题
+已知项目结构：
+- backend/web_ui.py 启动 Gradio
+- frontend 使用 Vite
+已修改：
+- package.json 添加 concurrently
+- backend API port 改为 7860
+待完成：
+- 测试 npm run dev:all
+关键约束：
+- 用户希望 python web_ui.py 一条命令启动前后端
+
+然后旧的长聊天记录、长文件内容、长工具输出会被替换成这段摘要。
+
+但如果某个关键细节没进摘要，比如：
+
+Windows WSL 路径必须用 /mnt/host/d/...
+
+那后面 Claude 就可能忘。
+
+7. 实战建议
+
+你用 Claude Code 做大项目时，最好不要完全依赖 auto-compact。
+
+更稳的做法是：
+
+/compact focus on current architecture, modified files, unresolved bugs, and exact next steps
+
+或者在项目里维护一个：
+
+TASK_LOG.md
+PROJECT_PLAN.md
+DECISIONS.md
+
+让 Claude 每完成一个阶段就更新这些文件。因为文件比聊天历史更可靠，compact 后可以重新读取。
+
+可以这样要求它：
+
+Before compacting, update TASK_LOG.md with:
+1. what has been changed
+2. files modified
+3. unresolved issues
+4. next exact command to run
+5. important decisions not to forget
+
+这比单纯依赖上下文摘要稳定很多。
+
+结论
+
+Claude Code 的上下文压缩机制可以概括为：
+
+上下文快满时，把旧 conversation / tool results / file reads 总结成结构化摘要，
+用摘要替代原始长历史，并重新注入 CLAUDE.md、auto memory、部分 skill/rules 等内容。
+
+所谓“七层”不是官方术语，更像是对 Claude Code 上下文管理体系的民间分层总结。官方能确认的核心是：自动 compact、手动 /compact、CLAUDE.md/auto memory 重新注入、path-scoped/nested 规则懒加载、Skill 有重注入上限、Subagent 用独立上下文隔离大读取。
