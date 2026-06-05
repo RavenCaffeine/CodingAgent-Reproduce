@@ -37,13 +37,19 @@ write, and edit files, run shell commands, and search the codebase.
   servers at startup (stdio or Streamable HTTP) and exposes their tools as
   `mcp_<server>_<tool>`, alongside the built-ins — and they pass the same
   permission checks.
+- **Context management**: two layers keep long sessions inside the window —
+  oversized tool results spill to disk (replaced by a stable preview + path),
+  and when history nears the limit the whole conversation is summarized, with
+  recently-read files re-attached so the model doesn't lose its place. `/compact`
+  triggers it manually.
 
 ## Setup (uv)
 
 Uses [uv](https://docs.astral.sh/uv/) for the environment. Dependencies live in
-`requirements.txt` (`anthropic`, `openai`, `pyyaml`, `pydantic`, `mcp`, `httpx`
-+ dev tools) so new ones are easy to add. No system dependencies — Glob/Grep are
-pure Python (MCP stdio servers may need their own runtime, e.g. `npx`).
+`requirements.txt` (`anthropic`, `openai`, `pyyaml`, `pydantic`, `mcp`, `httpx`,
+`tiktoken` + dev tools) so new ones are easy to add. No system dependencies —
+Glob/Grep are pure Python (MCP stdio servers may need their own runtime, e.g.
+`npx`).
 
 ```bash
 uv venv                              # create .venv
@@ -58,6 +64,11 @@ cp config.example.yaml config.yaml   # then edit it
 
 Add a dependency later: append it to `requirements.txt`, then re-run
 `uv pip install -r requirements.txt`.
+
+At runtime MewCode writes working state under `.mewcode/` in the project (plan
+files, permission rules, and the context-management spill directory
+`.mewcode/session/tool-results/` plus `replacement_records.jsonl`). The whole
+`.mewcode/` tree is gitignored — nothing there needs to be committed.
 
 ## Config (YAML)
 
@@ -225,6 +236,52 @@ permission checks). stdio child processes inherit only a small env whitelist plu
 the `env` you declare — host secrets like `ANTHROPIC_API_KEY` are never passed
 through.
 
+## Context management
+
+Long sessions blow past the model's context window, mostly via tool results.
+MewCode handles this in two layers, run before each API request:
+
+**Layer 1 (prevention, no LLM).** Before every request, any tool result over
+~50 000 characters is written to `.mewcode/session/tool-results/<id>.txt` and
+replaced in the prompt by a stable `<persisted-output>` preview + the file path
+(the model re-reads the file with `ReadFile` if it needs the full content). A
+per-message aggregate cap (~200 000 chars) spills the largest results first, and
+results in turns older than the last 10 are snipped to a short preview. Each
+replace/keep decision is logged once and re-read byte-for-byte on later turns, so
+Anthropic's prompt cache keeps hitting. The original conversation is never
+mutated — only the copy sent to the API.
+
+**Layer 2 (fallback, LLM).** Before each request the prompt size is estimated
+with `tiktoken`; when the larger of that estimate and the last reported usage
+crosses `window − 33 000` (≈167 K on a 200 K window, floored at half the window),
+the **older** part of the conversation is summarized into a nine-section
+structured summary while the **recent tail is kept verbatim** (the last
+~10 000 tokens / ≥5 messages, capped at 40 000), so precise recent context isn't
+lost. New history becomes `summary + boundary + recent originals`. Estimating up
+front means compaction fires *before* an oversized request is sent, not only
+after usage is reported. The **paths** of recently-read files, activated skill
+SOPs, and the available tool list are re-attached after the summary so the model
+keeps its bearings (file contents are not re-embedded — that would defeat the
+summary; the model re-reads with `ReadFile` if needed). Repeated summary failures
+trip a circuit breaker (3 in a row) that stops auto-triggering.
+
+The window defaults to 200 K but is configurable per provider via
+`context_window` in `config.yaml` — lower it when your effective budget (e.g. a
+tight per-minute rate limit) is smaller than the model's nominal window, so
+compaction kicks in earlier.
+
+**Rate limits.** A `429` rate-limit response is different from a context
+overflow: MewCode honors the provider's `retry-after` (or backs off
+exponentially) and retries the request up to 3 times instead of failing the turn.
+
+Both layers surface in the terminal as you work: each tool call prints its
+primary argument (`Bash: find . -name "*.go"`, `ReadFile: mewcode/agent.py`), a
+spill shows `◇ spilled N tool result(s) to disk (~X chars freed)`, and a
+compaction shows `◇ Compacted: <before> → <after> estimated tokens`.
+
+Type `/compact` (or `/c`) to compact manually; on a short session it just reports
+the current token count and does nothing.
+
 ## Run
 
 ```bash
@@ -241,6 +298,7 @@ uv run python -m mewcode my.yaml    # or an explicit path
 | `/do` (or `/plan off`) | Leave plan mode and resume normal execution. |
 | `/mode` | Show the current permission mode and list all modes. |
 | `/default` `/acceptEdits` `/plan` `/bypassPermissions` `/dontAsk` `/custom` | Switch directly to that permission mode (or use `/mode <name>`). |
+| `/compact` (or `/c`) | Summarize the conversation now to free up context (no-op on a short session). |
 | `/exit` (or `/quit`, `:q`) | Quit MewCode (prints a token-usage summary). |
 | `Ctrl-C` | Cancel the current turn (mid-stream or mid-tool); the session stays alive. Press it at the prompt to quit. |
 

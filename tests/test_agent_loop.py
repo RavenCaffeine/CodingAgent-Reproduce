@@ -255,3 +255,24 @@ async def test_cancel_propagates(tmp_path) -> None:
     # history stays consistent: the user message is still there
     contents = [m.content for m in conv.get_messages()]
     assert "hang" in contents
+
+
+def test_purge_plan_reminders_removes_stale_only():
+    """ch08 fix: leaving plan mode must drop stale plan reminders so the model
+    stops refusing tools in normal modes (but keep real user/assistant turns)."""
+    from mewcode.agent import _purge_plan_reminders
+    from mewcode.prompts import build_plan_mode_reminder
+
+    conv = ConversationManager()
+    conv.add_user_message("real user message")
+    conv.add_system_reminder(build_plan_mode_reminder("/x/p.md", False, 1))  # full
+    conv.add_assistant_message("real assistant message")
+    conv.add_system_reminder(build_plan_mode_reminder("/x/p.md", True, 3))  # sparse
+
+    _purge_plan_reminders(conv)
+
+    contents = [m.content for m in conv.history]
+    assert "real user message" in contents
+    assert "real assistant message" in contents
+    assert not any("Plan mode is active" in c for c in contents)
+    assert not any("Plan mode still active" in c for c in contents)

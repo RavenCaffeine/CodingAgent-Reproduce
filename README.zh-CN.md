@@ -30,13 +30,15 @@
 - **MCP 客户端**：启动时连接外部 [Model Context Protocol](https://modelcontextprotocol.io)
   服务器（stdio 或 Streamable HTTP），把远端工具以 `mcp_<server>_<tool>` 注册，
   和内置工具并列，并同样要过权限检查。
+- **上下文管理**：两层把长会话压在窗口内——超大工具结果落盘（对话里只留预览+路径），
+  历史逼近上限时整段摘要并把最近读过的文件回贴，模型不丢工作记忆。`/compact` 手动触发。
 
 ## 安装（uv）
 
 使用 [uv](https://docs.astral.sh/uv/) 管理环境。依赖写在 `requirements.txt` 里
-（`anthropic`、`openai`、`pyyaml`、`pydantic`、`mcp`、`httpx` + 开发工具），方便后续
-增添。无系统依赖 —— Glob/Grep 是纯 Python 实现（MCP stdio server 可能需要自己的运行时，
-如 `npx`）。
+（`anthropic`、`openai`、`pyyaml`、`pydantic`、`mcp`、`httpx`、`tiktoken` + 开发工具），
+方便后续增添。无系统依赖 —— Glob/Grep 是纯 Python 实现（MCP stdio server 可能需要自己的
+运行时，如 `npx`）。
 
 ```bash
 uv venv                              # 创建 .venv
@@ -52,6 +54,10 @@ copy config.example.yaml config.yaml # win
 
 后续加依赖：往 `requirements.txt` 追加一行，再执行
 `uv pip install -r requirements.txt`。
+
+运行时 MewCode 把工作状态写在项目下的 `.mewcode/`（plan 文件、权限规则，以及上下文管理的
+落盘目录 `.mewcode/session/tool-results/` 和 `replacement_records.jsonl`）。整个 `.mewcode/`
+已被 gitignore，无需提交。
 
 ## 配置（YAML）
 
@@ -193,6 +199,36 @@ mcp_servers:
 调用（同样要过权限检查）。stdio 子进程只继承一份小白名单 env 加你声明的 `env`——
 `ANTHROPIC_API_KEY` 等宿主机敏感变量绝不透传。
 
+## 上下文管理
+
+长会话很容易把模型上下文窗口顶爆，主要来自工具结果。MewCode 用两层在每次 API 请求前处理：
+
+**第一层（预防，不调 LLM）。** 每次请求前，超过约 50000 字符的工具结果写到
+`.mewcode/session/tool-results/<id>.txt`，对话里替换为稳定的 `<persisted-output>`
+预览 + 文件路径（需要全文时模型用 `ReadFile` 取回）。单条消息还有合计上限（约 200000 字符），
+超了挑大的先落盘；比最近 10 轮更早的工具结果会被裁成短预览。每个「替换/保留」决定只做一次、
+后续逐字节复读，让 Anthropic 前缀缓存持续命中。原始对话从不被改写——只改发给 API 的那份副本。
+
+**第二层（兜底，调 LLM）。** 每次请求前先用 `tiktoken` 预估 prompt 大小；当「预估值与上次
+回报 usage 的较大者」超过 `窗口 − 33000`（200K 窗口约 167K，并以窗口一半为下限）时，把**较早**
+的对话摘要成九节结构化摘要，而**最近的原文保留不动**（最后约 10000 tokens / ≥5 条消息，上限
+40000），这样精确的近期上下文不会丢。新历史变成 `摘要 + 边界提示 + 近期原文`。**提前预估**意味着
+压缩在超大请求发出**之前**就触发，而不是等 usage 回报之后。最近读过文件的**路径**、已激活技能的
+SOP、可用工具列表会拼到摘要之后，模型不丢方向（文件**内容不重嵌**——否则会抵消摘要；需要时模型用
+`ReadFile` 重读）。摘要连续失败 3 次触发熔断，停止自动触发。
+
+窗口默认 200K，可在 `config.yaml` 用 `context_window` 按 provider 配置——当你的实际预算（比如
+很紧的每分钟速率限制）小于模型标称窗口时，调小它让压缩更早介入。
+
+**速率限制。** `429` 速率限制和上下文溢出是两回事：MewCode 会遵循 provider 的 `retry-after`
+（或指数退避）最多重试 3 次，而不是让这一回合直接失败。
+
+两层都会实时显示在终端：每次工具调用打印它的主要参数（`Bash: find . -name "*.go"`、
+`ReadFile: mewcode/agent.py`），落盘显示 `◇ spilled N tool result(s) to disk (~X chars freed)`，
+压缩显示 `◇ Compacted: <压缩前> → <压缩后> estimated tokens`。
+
+输入 `/compact`（或 `/c`）手动压缩；短会话下只报告当前 token 数、不做处理。
+
 ## 运行
 
 ```bash
@@ -209,6 +245,7 @@ uv run python -m mewcode my.yaml    # 或指定路径
 | `/do`（或 `/plan off`） | 退出规划模式，恢复正常执行。 |
 | `/mode` | 查看当前权限档位并列出全部档位。 |
 | `/default` `/acceptEdits` `/plan` `/bypassPermissions` `/dontAsk` `/custom` | 直接切到对应权限档位（也可用 `/mode <名称>`）。 |
+| `/compact`（或 `/c`） | 立即摘要压缩对话以腾出上下文（短会话下不操作）。 |
 | `/exit`（或 `/quit`、`:q`） | 退出 MewCode（打印 token 用量小结）。 |
 | `Ctrl-C` | 取消当前回合（流式中或工具执行中），会话不退出；在输入提示符处按则退出程序。 |
 

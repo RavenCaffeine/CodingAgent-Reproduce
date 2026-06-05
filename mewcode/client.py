@@ -98,6 +98,43 @@ def _supports_adaptive_thinking(model: str) -> bool:
 # Anthropic (T4)
 # --------------------------------------------------------------------------- #
 
+# ch08: prompt-cache breakpoints. Marking the system prompt, the last tool, and
+# the tail of the last user message with an ephemeral cache_control lets
+# Anthropic reuse the stable prefix (which Layer 1's byte-stable replacements
+# keep intact) instead of re-billing it every turn.
+_EPHEMERAL = {"type": "ephemeral"}
+
+
+def _mark_last_user_tail_for_cache(messages: list[dict[str, Any]]) -> None:
+    """Add a cache breakpoint to the last user message's final block (in place)."""
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            # up-convert string content into a single text block
+            content = [{"type": "text", "text": content}]
+            msg["content"] = content
+        if isinstance(content, list) and content:
+            last = content[-1]
+            if isinstance(last, dict):
+                last["cache_control"] = _EPHEMERAL
+        return
+
+
+def _mark_last_tool_for_cache(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a shallow copy of tools with the last one cache-marked.
+
+    Copies so the caller's shared tool table is not polluted across turns.
+    """
+    if not tools:
+        return tools
+    out = list(tools)
+    out[-1] = {**out[-1], "cache_control": _EPHEMERAL}
+    return out
+
 
 class AnthropicClient(LLMClient):
     """Anthropic Messages API streaming client."""
@@ -130,15 +167,21 @@ class AnthropicClient(LLMClient):
         import anthropic
 
         messages = conversation.serialize("anthropic")
+        # ch08: cache breakpoint on the tail of the last user message.
+        _mark_last_user_tail_for_cache(messages)
         kwargs: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": self._max_output_tokens,
             "messages": messages,
         }
         if system:
-            kwargs["system"] = system
+            # ch08: cache the (stable) system prompt prefix.
+            kwargs["system"] = [
+                {"type": "text", "text": system, "cache_control": _EPHEMERAL}
+            ]
         if tools:
-            kwargs["tools"] = tools
+            # ch08: cache breakpoint after the tool definitions.
+            kwargs["tools"] = _mark_last_tool_for_cache(tools)
         if self._config.thinking:
             kwargs["thinking"] = self._thinking_kwarg()
 
